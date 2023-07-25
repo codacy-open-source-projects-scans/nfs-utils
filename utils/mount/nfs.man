@@ -592,37 +592,19 @@ If
 .B mtls
 is specified, the client uses RPC-with-TLS to authenticate itself and
 to provide in-transit confidentiality.
-If the server does not support RPC-with-TLS or peer authentication
-fails, the mount attempt fails.
+If either
+.B tls
+or
+.B mtls
+is specified and the server does not support RPC-with-TLS or peer
+authentication fails, the mount attempt fails.
 .IP
 If the
 .B xprtsec=
 option is not specified,
-the default behavior depends on the kernel,
+the default behavior depends on the kernel version,
 but is usually equivalent to
 .BR "xprtsec=none" .
-.TP 1.5i
-.BI write= behavior
-Controls how the NFS client handles the
-.BR write (2)
-system call.
-.I behavior
-can be one of
-.BR lazy ,
-.BR eager ,
-or
-.BR wait .
-If
-.B lazy
-(the default) is specified, then the NFS client delays sending application
-writes to the NFS server as described in the DATA AND METADATA COHERENCE
-section.  If
-.B eager
-is specified, then the NFS client sends off the write immediately as an
-unstable WRITE to the NFS server.  If
-.B wait
-is specified, then the NFS client sends off the write immediately as an
-unstable WRITE to the NFS server and then waits for the reply.
 .SS "Options for NFS versions 2 and 3 only"
 Use these options, along with the options in the above subsection,
 for NFS versions 2 and 3 only.
