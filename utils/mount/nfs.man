@@ -584,14 +584,17 @@ If
 is specified,
 transport layer security is forced off, even if the NFS server supports
 transport layer security.
+.IP
 If
 .B tls
 is specified, the client uses RPC-with-TLS to provide in-transit
 confidentiality.
+.IP
 If
 .B mtls
 is specified, the client uses RPC-with-TLS to authenticate itself and
 to provide in-transit confidentiality.
+.IP
 If either
 .B tls
 or
