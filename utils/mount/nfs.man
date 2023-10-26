@@ -1013,7 +1013,6 @@ file. See
 .BR nfsmount.conf(5)
 for details.
 .SH EXAMPLES
-mount option.
 To mount using NFS version 3,
 use the
 .B nfs
