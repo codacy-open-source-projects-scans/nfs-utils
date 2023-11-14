@@ -7,16 +7,6 @@
 #include <dlfcn.h>
 #endif
 #include <event2/event.h>
-#include <limits.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <sys/random.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <sys/un.h>
-#include <sys/vfs.h>
-#include <unistd.h>
 
 #include "conffile.h"
 #include "reexport_backend.h"

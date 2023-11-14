@@ -277,6 +277,9 @@ AC_TCP_WRAPPERS
 # Arrange for large-file support
 AC_SYS_LARGEFILE
 
+dnl Check for getrandom() libc support
+AC_GETRANDOM
+
 AC_CONFIG_SRCDIR([support/include/config.h.in])
 AC_CONFIG_HEADERS([support/include/config.h])
 
