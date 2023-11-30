@@ -119,7 +119,7 @@ export_read(char *fname, int ignore_hosts)
 	int reexport_found = 0;
 
 	setexportent(fname, "r");
-	while ((eep = getexportent(0,1)) != NULL) {
+	while ((eep = getexportent(0)) != NULL) {
 		exp = export_lookup(eep->e_hostname, eep->e_path, ignore_hosts);
 		if (!exp) {
 			if (export_create(eep, 0))
