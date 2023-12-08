@@ -754,6 +754,7 @@ void
 conf_init_file(const char *conf_file)
 {
 	unsigned int i;
+	int j;
 
 	for (i = 0; i < sizeof conf_bindings / sizeof conf_bindings[0]; i++)
 		LIST_INIT (&conf_bindings[i]);
@@ -773,8 +774,8 @@ conf_init_file(const char *conf_file)
 	if (strncmp(conf_file, "/etc/", 5) == 0) {
 		char *usrconf = NULL;
 
-		asprintf(&usrconf, "/usr%s", conf_file);
-		if (usrconf) {
+		j = asprintf(&usrconf, "/usr%s", conf_file);
+		if (usrconf && j > 0) {
 			conf_load_file(usrconf);
 			conf_init_dir(usrconf);
 			free(usrconf);
