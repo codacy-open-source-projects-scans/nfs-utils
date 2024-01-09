@@ -70,6 +70,9 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <syscall.h>
+#ifdef HAVE_TIRPC_GSS_SECCREATE
+#include <rpc/rpcsec_gss.h>
+#endif
 
 #include "gssd.h"
 #include "err_util.h"
@@ -330,6 +333,11 @@ create_auth_rpc_client(struct clnt_info *clp,
 	struct timeval	timeout;
 	struct sockaddr		*addr = (struct sockaddr *) &clp->addr;
 	socklen_t		salen;
+#ifdef HAVE_TIRPC_GSS_SECCREATE
+	rpc_gss_options_req_t	req;
+	rpc_gss_options_ret_t	ret;
+	char			mechanism[] = "kerberos_v5";
+#endif
 	pthread_t tid = pthread_self();
 
 	sec.qop = GSS_C_QOP_DEFAULT;
@@ -410,9 +418,17 @@ create_auth_rpc_client(struct clnt_info *clp,
 
 	printerr(3, "create_auth_rpc_client(0x%lx): creating context with server %s\n", 
 		tid, tgtname);
+#ifdef HAVE_TIRPC_GSS_SECCREATE
+	memset(&req, 0, sizeof(req));
+	req.my_cred = sec.cred;
+	auth = rpc_gss_seccreate(rpc_clnt, tgtname, mechanism,
+			rpcsec_gss_svc_none, NULL, &req, &ret);
+#else
 	auth = authgss_create_default(rpc_clnt, tgtname, &sec);
+#endif
 	if (!auth) {
-		if (sec.minor_status == KRB5KRB_AP_ERR_BAD_INTEGRITY) {
+#ifdef HAVE_TIRPC_GSS_SECCREATE
+		if (ret.minor_status == KRB5KRB_AP_ERR_BAD_INTEGRITY) {
 			printerr(2, "WARNING: server=%s failed context "
 				 "creation with KRB5_AP_ERR_BAD_INTEGRITY\n",
 				 clp->servername);
@@ -422,19 +438,23 @@ create_auth_rpc_client(struct clnt_info *clp,
 			else
 				retval = gssd_k5_remove_bad_service_cred(clp->servername);
 			if (!retval) {
-				auth = authgss_create_default(rpc_clnt, tgtname,
-						&sec);
+				auth = rpc_gss_seccreate(rpc_clnt, tgtname,
+						mechanism, rpcsec_gss_svc_none,
+						NULL, &req, &ret);
 				if (auth)
 					goto success;
 			}
 		}
+#endif
 		/* Our caller should print appropriate message */
 		printerr(2, "WARNING: Failed to create krb5 context for "
 			    "user with uid %d for server %s\n",
 			 uid, tgtname);
 		goto out_fail;
 	}
+#ifdef HAVE_TIRPC_GSS_SECCREATE
 success:
+#endif
 	/* Success !!! */
 	rpc_clnt->cl_auth = auth;
 	*clnt_return = rpc_clnt;
