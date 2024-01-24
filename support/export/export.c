@@ -140,7 +140,7 @@ export_read(char *fname, int ignore_hosts)
 					continue;
 
 				if (exp->m_export.e_flags & NFSEXP_FSID) {
-					xlog(L_ERROR, "When a reexport= option is present no manully assigned numerical fsid= options are allowed");
+					xlog(L_ERROR, "When a reexport= option is present no manually assigned numerical fsid= options are allowed");
 					return -1;
 				}
 			}

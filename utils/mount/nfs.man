@@ -964,7 +964,7 @@ Some server features misbehave in the face of a migration-compatible
 identification string.
 The
 .B nomigration
-option retains the use of a traditional client indentification string
+option retains the use of a traditional client identification string
 which is compatible with legacy NFS servers.
 This is also the behavior if neither option is specified.
 A client's open and lock state cannot be migrated transparently
@@ -1832,7 +1832,7 @@ auxiliary services such as the NLM service can choose
 any unused port number at random.
 .P
 Common firewall configurations block the well-known rpcbind port.
-In the absense of an rpcbind service,
+In the absence of an rpcbind service,
 the server administrator fixes the port number
 of NFS-related services so that the firewall
 can allow access to specific NFS service ports.

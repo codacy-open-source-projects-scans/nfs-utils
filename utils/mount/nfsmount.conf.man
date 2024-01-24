@@ -43,7 +43,7 @@ and will be shifted to lower case before being passed to the filesystem.
 .PP
 Boolean mount options which do not need an equals sign must be given as
 .RI \[dq] option =True".
-Instead of preceeding such an option with
+Instead of preceding such an option with
 .RB \[dq] no \[dq]
 its negation must be given as
 .RI \[dq] option =False".

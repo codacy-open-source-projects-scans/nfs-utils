@@ -298,7 +298,7 @@ set.
 
 The
 .I nocrossmnt
-option can explictly disable
+option can explicitly disable
 .I crossmnt
 if it was previously set.  This is rarely useful.
 .TP
