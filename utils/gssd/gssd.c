@@ -1232,6 +1232,12 @@ main(int argc, char *argv[])
 
 	daemon_init(fg);
 
+#ifdef HAVE_SET_ALLOWABLE_ENCTYPES
+	rc = get_allowed_enctypes();
+	if (rc)
+		exit(EXIT_FAILURE);
+#endif
+
 	if (gssd_check_mechs() != 0)
 		errx(1, "Problem with gssapi library");
 

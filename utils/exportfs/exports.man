@@ -445,6 +445,9 @@ the given list an alternative location for the filesystem.
 filesystem is not required; so, for example,
 .IR "mount --bind" " /path /path"
 is sufficient.)
+
+This option affects only NFSv4 clients. Other clients will ignore
+all "refer=" parts.
 .TP
 .IR replicas= path@host[+host][:path@host[+host]]
 If the client asks for alternative locations for the export point, it

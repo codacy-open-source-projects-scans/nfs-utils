@@ -186,6 +186,10 @@ infrequently used request types are retried after 1.1 seconds.
 After each retransmission, the NFS client doubles the timeout for
 that request,
 up to a maximum timeout length of 60 seconds.
+.IP
+Any timeo value greater than default value will be set to the default value.
+For TCP and RDMA, default value is 600 (60 seconds).
+For UDP, default value is 60 (6 seconds).
 .TP 1.5i
 .BI retrans= n
 The number of times the NFS client retries a request before
