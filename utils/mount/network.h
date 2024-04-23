@@ -39,10 +39,10 @@ typedef struct {
 static const struct timeval TIMEOUT = { 20, 0 };
 static const struct timeval RETRY_TIMEOUT = { 3, 0 };
 
-int probe_bothports(clnt_addr_t *, clnt_addr_t *);
+int probe_bothports(clnt_addr_t *, clnt_addr_t *, int);
 int nfs_probe_bothports(const struct sockaddr *, const socklen_t,
 			struct pmap *, const struct sockaddr *,
-			const socklen_t, struct pmap *, int);
+			const socklen_t, struct pmap *, int, int);
 int nfs_gethostbyname(const char *, struct sockaddr_in *);
 int nfs_lookup(const char *hostname, const sa_family_t family,
 		struct sockaddr *sap, socklen_t *salen);

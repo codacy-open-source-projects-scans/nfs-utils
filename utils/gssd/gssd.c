@@ -559,9 +559,9 @@ scan_active_thread_list(void)
 					do_error_downcall(info->fd, info->uid, -ETIMEDOUT);
 				} else {
 					if (!(info->flags & UPCALL_THREAD_WARNED)) {
-						printerr(0, "watchdog: thread id 0x%lx running for %ld seconds\n",
+						printerr(0, "watchdog: thread id 0x%lx running for %lld seconds\n",
 								info->tid,
-								now.tv_sec - info->timeout.tv_sec + upcall_timeout);
+								(long long int)(now.tv_sec - info->timeout.tv_sec + upcall_timeout));
 						info->flags |= UPCALL_THREAD_WARNED;
 					}
 				}

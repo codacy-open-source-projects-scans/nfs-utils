@@ -171,7 +171,7 @@ do_downcall(int k5_fd, uid_t uid, struct authgss_private_data *pd,
 
 	if (get_verbosity() > 1)
 		printerr(2, "do_downcall(0x%lx): lifetime_rec=%s acceptor=%.*s\n",
-			tid, sec2time(lifetime_rec), acceptor->length, acceptor->value);
+			tid, sec2time(lifetime_rec), (int)acceptor->length, (char *)acceptor->value);
 	buf_size = sizeof(uid) + sizeof(timeout) + sizeof(pd->pd_seq_win) +
 		sizeof(pd->pd_ctx_hndl.length) + pd->pd_ctx_hndl.length +
 		sizeof(context_token->length) + context_token->length +
@@ -287,14 +287,14 @@ populate_port(struct sockaddr *sa, const socklen_t salen,
 
 	port = nfs_getport(sa, salen, program, version, protocol);
 	if (!port) {
-		printerr(0, "ERROR: unable to obtain port for prog %ld "
-			    "vers %ld\n", program, version);
+		printerr(0, "ERROR: unable to obtain port for prog %lu "
+			    "vers %lu\n", (long unsigned int)program, (long unsigned int)version);
 		return 0;
 	}
 
 set_port:
 	printerr(2, "DEBUG: setting port to %hu for prog %lu vers %lu\n", port,
-		 program, version);
+		 (long unsigned int)program, (long unsigned int)version);
 
 	switch (sa->sa_family) {
 	case AF_INET:

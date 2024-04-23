@@ -307,9 +307,9 @@ gssd_find_existing_krb5_ccache(uid_t uid, char *dirname,
 				score++;
 
 			printerr(3, "CC '%s'(%s@%s) passed all checks and"
-				    " has mtime of %u\n",
+				    " has mtime of %llu\n",
 				 buf, princname, realm, 
-				 tmp_stat.st_mtime);
+				 (long long unsigned)tmp_stat.st_mtime);
 			/*
 			 * if more than one match is found, return the most
 			 * recent (the one with the latest mtime), and
@@ -344,10 +344,10 @@ gssd_find_existing_krb5_ccache(uid_t uid, char *dirname,
 				}
 				printerr(3, "CC '%s:%s/%s' is our "
 					    "current best match "
-					    "with mtime of %u\n",
-					 cctype, dirname,
+					    "with mtime of %llu\n",
+					 *cctype, dirname,
 					 best_match_dir->d_name,
-					 best_match_stat.st_mtime);
+					 (long long unsigned)best_match_stat.st_mtime);
 			}
 			free(princname);
 			free(realm);

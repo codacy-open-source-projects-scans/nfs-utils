@@ -123,13 +123,13 @@ nfs2_mount(CLIENT *clnt, mnt2arg_t *mnt2arg, mnt2res_t *mnt2res)
 
 static int
 nfs_call_mount(clnt_addr_t *mnt_server, clnt_addr_t *nfs_server,
-	       mntarg_t *mntarg, mntres_t *mntres)
+	       mntarg_t *mntarg, mntres_t *mntres, int resvp)
 {
 	CLIENT *clnt;
 	enum clnt_stat stat;
 	int msock;
 
-	if (!probe_bothports(mnt_server, nfs_server))
+	if (!probe_bothports(mnt_server, nfs_server, resvp))
 		goto out_bad;
 
 	clnt = mnt_openclnt(mnt_server, &msock);
@@ -164,7 +164,8 @@ nfs_call_mount(clnt_addr_t *mnt_server, clnt_addr_t *nfs_server,
 static int
 parse_options(char *old_opts, struct nfs_mount_data *data,
 	      int *bg, int *retry, clnt_addr_t *mnt_server,
-	      clnt_addr_t *nfs_server, char *new_opts, const int opt_size)
+	      clnt_addr_t *nfs_server, char *new_opts, const int opt_size,
+	      int *resvp)
 {
 	struct sockaddr_in *mnt_saddr = &mnt_server->saddr;
 	struct pmap *mnt_pmap = &mnt_server->pmap;
@@ -177,6 +178,7 @@ parse_options(char *old_opts, struct nfs_mount_data *data,
 
 	data->flags = 0;
 	*bg = 0;
+	*resvp = 1;
 
 	len = strlen(new_opts);
 	tmp_opts = xstrdup(old_opts);
@@ -365,6 +367,8 @@ parse_options(char *old_opts, struct nfs_mount_data *data,
 				data->flags &= ~NFS_MOUNT_NOAC;
 				if (!val)
 					data->flags |= NFS_MOUNT_NOAC;
+			} else if (!strcmp(opt, "resvport")) {
+				*resvp = val;
 #if NFS_MOUNT_VERSION >= 2
 			} else if (!strcmp(opt, "tcp")) {
 				data->flags &= ~NFS_MOUNT_TCP;
@@ -498,6 +502,7 @@ nfsmount(const char *spec, const char *node, int flags,
 	static struct nfs_mount_data data;
 	int val;
 	static int doonce = 0;
+	int resvp;
 
 	clnt_addr_t mnt_server = { 
 		.hostname = &mounthost 
@@ -582,7 +587,7 @@ nfsmount(const char *spec, const char *node, int flags,
 	/* parse options */
 	new_opts[0] = 0;
 	if (!parse_options(old_opts, &data, &bg, &retry, &mnt_server, &nfs_server,
-			   new_opts, sizeof(new_opts)))
+			   new_opts, sizeof(new_opts), &resvp))
 		goto fail;
 	if (!nfsmnt_check_compat(nfs_pmap, mnt_pmap))
 		goto fail;
@@ -620,6 +625,7 @@ nfsmount(const char *spec, const char *node, int flags,
 #if NFS_MOUNT_VERSION >= 5
 	printf(_(", sec = %u"), data.pseudoflavor);
 	printf(_(", readdirplus = %d"), (data.flags & NFS_MOUNT_NORDIRPLUS) != 0);
+	printf(_(", resvp = %u"), resvp);
 #endif
 	printf("\n");
 #endif
@@ -670,7 +676,7 @@ nfsmount(const char *spec, const char *node, int flags,
 				sleep(30);
 
 			stat = nfs_call_mount(&mnt_server, &nfs_server,
-					      &dirname, &mntres);
+					      &dirname, &mntres, resvp);
 			if (stat)
 				break;
 			memcpy(nfs_pmap, &save_nfs, sizeof(*nfs_pmap));

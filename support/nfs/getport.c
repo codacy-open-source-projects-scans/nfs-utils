@@ -730,7 +730,8 @@ static unsigned short nfs_gp_getport(CLIENT *client,
  */
 int nfs_rpc_ping(const struct sockaddr *sap, const socklen_t salen,
 		 const rpcprog_t program, const rpcvers_t version,
-		 const unsigned short protocol, const struct timeval *timeout)
+		 const unsigned short protocol, const struct timeval *timeout,
+		 const int resvport)
 {
 	union nfs_sockaddr address;
 	struct sockaddr *saddr = &address.sa;
@@ -744,8 +745,11 @@ int nfs_rpc_ping(const struct sockaddr *sap, const socklen_t salen,
 	nfs_clear_rpc_createerr();
 
 	memcpy(saddr, sap, (size_t)salen);
-	client = nfs_get_rpcclient(saddr, salen, protocol,
-						program, version, &tout);
+	client = resvport ?
+		 nfs_get_priv_rpcclient(saddr, salen, protocol,
+					program, version, &tout) :
+		 nfs_get_rpcclient(saddr, salen, protocol,
+				   program, version, &tout);
 	if (client != NULL) {
 		result = nfs_gp_ping(client, tout);
 		nfs_gp_map_tcp_errorcodes(protocol);
