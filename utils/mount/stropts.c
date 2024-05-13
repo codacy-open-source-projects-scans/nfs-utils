@@ -337,20 +337,6 @@ static int nfs_verify_lock_option(struct mount_options *options)
 	return 1;
 }
 
-static const char *nfs_resvport_opttbl[] = {
-	"noresvport",
-	"resvport",
-	NULL,
-};
-
-/*
- * Returns true unless "noresvport" is set
- */
-static int nfs_resvport_option(struct mount_options *options)
-{
-	return po_rightmost(options, nfs_resvport_opttbl) != 0;
-}
-
 static int nfs_insert_sloppy_option(struct mount_options *options)
 {
 	if (linux_version_code() < MAKE_VERSION(2, 6, 27))
@@ -564,7 +550,7 @@ static int nfs_construct_new_options(struct mount_options *options,
  * FALSE is returned if some failure occurred.
  */
 static int
-nfs_rewrite_pmap_mount_options(struct mount_options *options, int checkv4, int resvp)
+nfs_rewrite_pmap_mount_options(struct mount_options *options, int checkv4)
 {
 	union nfs_sockaddr nfs_address;
 	struct sockaddr *nfs_saddr = &nfs_address.sa;
@@ -618,8 +604,7 @@ nfs_rewrite_pmap_mount_options(struct mount_options *options, int checkv4, int r
 	 * negotiate.  Bail now if we can't contact it.
 	 */
 	if (!nfs_probe_bothports(mnt_saddr, mnt_salen, &mnt_pmap,
-				 nfs_saddr, nfs_salen, &nfs_pmap,
-				 checkv4, resvp)) {
+				 nfs_saddr, nfs_salen, &nfs_pmap, checkv4)) {
 		errno = ESPIPE;
 		if (rpc_createerr.cf_stat == RPC_PROGNOTREGISTERED)
 			errno = EOPNOTSUPP;
@@ -685,7 +670,6 @@ static int nfs_do_mount_v3v2(struct nfsmount_info *mi,
 {
 	struct mount_options *options = po_dup(mi->options);
 	int result = 0;
-	int resvp;
 
 	if (!options) {
 		errno = ENOMEM;
@@ -720,13 +704,11 @@ static int nfs_do_mount_v3v2(struct nfsmount_info *mi,
 		goto out_fail;
 	}
 
-	resvp = nfs_resvport_option(options);
-
 	if (verbose)
 		printf(_("%s: trying text-based options '%s'\n"),
 			progname, *mi->extra_opts);
 
-	if (!nfs_rewrite_pmap_mount_options(options, checkv4, resvp))
+	if (!nfs_rewrite_pmap_mount_options(options, checkv4))
 		goto out_fail;
 
 	result = nfs_sys_mount(mi, options);

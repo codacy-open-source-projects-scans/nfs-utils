@@ -170,8 +170,7 @@ extern int		nfs_rpc_ping(const struct sockaddr *sap,
 				const rpcprog_t program,
 				const rpcvers_t version,
 				const unsigned short protocol,
-				const struct timeval *timeout,
-				const int resvport);
+				const struct timeval *timeout);
 
 /* create AUTH_SYS handle with no supplemental groups */
 extern AUTH *			 nfs_authsys_create(void);
