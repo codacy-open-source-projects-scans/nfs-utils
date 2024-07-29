@@ -365,12 +365,12 @@ gssd_read_service_info(int dirfd, struct clnt_info *clp)
 
 fail:
 	printerr(0, "ERROR: failed to parse %s/info\n", clp->relpath);
-	clp->upcall_address = strdup(address);
-	clp->upcall_port = strdup(port);
+	clp->upcall_address = address ? strdup(address) : NULL;
+	clp->upcall_port = port ? strdup(port) : NULL;
 	clp->upcall_program = program;
 	clp->upcall_vers = version;
-	clp->upcall_protoname = strdup(protoname);
-	clp->upcall_service = strdup(service);
+	clp->upcall_protoname = protoname ? strdup(protoname) : NULL;
+	clp->upcall_service = service ? strdup(service) : NULL;
 	free(servername);
 	free(protoname);
 	clp->servicename = NULL;
