@@ -1,0 +1,14 @@
+[Unit]
+Description=NFS Mount Daemon
+Documentation=man:rpc.mountd(8)
+DefaultDependencies=no
+Requires=proc-fs-nfsd.mount
+Wants=network-online.target
+After=proc-fs-nfsd.mount
+After=network-online.target local-fs.target
+After=rpcbind.socket
+BindsTo=nfs-server.service
+
+[Service]
+Type=forking
+ExecStart=/usr/sbin/rpc.mountd
