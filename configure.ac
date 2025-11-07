@@ -1,6 +1,6 @@
 dnl Process this file with autoconf to produce a configure script.
 dnl
-AC_INIT([linux nfs-utils],[2.8.1],[linux-nfs@vger.kernel.org],[nfs-utils])
+AC_INIT([linux nfs-utils],[2.8.4],[linux-nfs@vger.kernel.org],[nfs-utils])
 AC_CANONICAL_BUILD([])
 AC_CANONICAL_HOST([])
 AC_CONFIG_MACRO_DIR(aclocal)
@@ -248,9 +248,9 @@ AC_ARG_ENABLE(nfsrahead,
 	fi
 
 AC_ARG_ENABLE(nfsdcltrack,
-	[AS_HELP_STRING([--disable-nfsdcltrack],[disable NFSv4 clientid tracking programs @<:@default=no@:>@])],
+	[AS_HELP_STRING([--enable-nfsdcltrack],[enable NFSv4 clientid tracking programs @<:@default=no@:>@])],
 	enable_nfsdcltrack=$enableval,
-	enable_nfsdcltrack="yes")
+	enable_nfsdcltrack="no")
 
 AC_ARG_ENABLE(nfsdctl,
 	[AS_HELP_STRING([--disable-nfsdctl],[disable nfsdctl program for controlling nfsd@<:@default=no@:>@])],
@@ -268,6 +268,10 @@ AC_ARG_ENABLE(nfsdctl,
 				                   [[int foo = NFSD_CMD_POOL_MODE_GET;]])],
 				   [AC_DEFINE([USE_SYSTEM_NFSD_NETLINK_H], 1,
 					      ["Use system's linux/nfsd_netlink.h"])])
+		AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[#include <linux/lockd_netlink.h>]],
+				                   [[int foo = LOCKD_CMD_SERVER_GET;]])],
+				   [AC_DEFINE([USE_SYSTEM_LOCKD_NETLINK_H], 1,
+					      ["Use system's linux/lockd_netlink.h"])])
 	fi
 
 AC_ARG_ENABLE(nfsv4server,
@@ -574,7 +578,7 @@ AC_FUNC_ERROR_AT_LINE
 AC_FUNC_FORK
 AC_FUNC_GETGROUPS
 AC_FUNC_GETMNTENT
-AC_PROG_GCC_TRADITIONAL
+AC_PROG_CC
 AC_FUNC_LSTAT
 AC_FUNC_LSTAT_FOLLOWS_SLASHED_SYMLINK
 AC_HEADER_MAJOR
