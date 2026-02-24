@@ -46,9 +46,14 @@
 #include "conffile.h"
 #include "xlog.h"
 
-/* compile note:
- * gcc -I/usr/include/libnl3/ -o <prog-name> <prog-name>.c -lnl-3 -lnl-genl-3
- */
+/* The index of the "lockd" netlink family */
+static int lockd_nl_family;
+
+/* The index of the "nfsd" netlink family */
+static int nfsd_nl_family;
+
+/* The highest attribute index supported by NFSD_CMD_THREADS_SET on this kernel */
+int nfsd_threads_max_nlattr;
 
 struct nfs_version {
 	uint8_t	major;
@@ -324,11 +329,9 @@ static void parse_threads_get(struct genlmsghdr *gnlh)
 		case NFSD_A_SERVER_THREADS:
 			pool_threads[i++] = nla_get_u32(attr);
 			break;
-#if HAVE_DECL_NFSD_A_SERVER_MIN_THREADS
 		case NFSD_A_SERVER_MIN_THREADS:
 			printf("min-threads: %u\n", nla_get_u32(attr));
 			break;
-#endif
 		default:
 			break;
 		}
@@ -435,16 +438,10 @@ static struct nl_sock *netlink_sock_alloc(void)
 	return sock;
 }
 
-static struct nl_msg *netlink_msg_alloc(struct nl_sock *sock, const char *family)
+static struct nl_msg *netlink_msg_alloc(struct nl_sock *sock, int family)
 {
 	struct nl_msg *msg;
 	int id;
-
-	id = genl_ctrl_resolve(sock, family);
-	if (id < 0) {
-		xlog(L_ERROR, "failed to resolve %s generic netlink family", family);
-		return NULL;
-	}
 
 	msg = nlmsg_alloc();
 	if (!msg) {
@@ -452,13 +449,125 @@ static struct nl_msg *netlink_msg_alloc(struct nl_sock *sock, const char *family
 		return NULL;
 	}
 
-	if (!genlmsg_put(msg, 0, 0, id, 0, 0, 0, 0)) {
+	if (!genlmsg_put(msg, 0, 0, family, 0, 0, 0, 0)) {
 		xlog(L_ERROR, "failed to add generic netlink headers to netlink message");
 		nlmsg_free(msg);
 		return NULL;
 	}
 
 	return msg;
+}
+
+static int resolve_family(struct nl_sock *sock, const char *name, int loglevel)
+{
+	int family = genl_ctrl_resolve(sock, name);
+
+	if (family < 0) {
+		xlog(loglevel, "failed to resolve %s generic netlink family: %d", name, family);
+		family = 0;
+	}
+	return family;
+}
+
+static int lockd_nl_family_setup(struct nl_sock *sock)
+{
+	if (!lockd_nl_family) {
+		lockd_nl_family = resolve_family(sock, LOCKD_FAMILY_NAME, L_WARNING);
+		if (lockd_nl_family) {
+			system("modprobe lockd");
+			lockd_nl_family = resolve_family(sock, LOCKD_FAMILY_NAME, L_ERROR);
+		}
+	}
+	return lockd_nl_family;
+}
+
+static int nfsd_nl_family_setup(struct nl_sock *sock)
+{
+	if (!nfsd_nl_family) {
+		nfsd_nl_family = resolve_family(sock, NFSD_FAMILY_NAME, L_WARNING);
+		if (!nfsd_nl_family) {
+			system("modprobe nfsd");
+			nfsd_nl_family = resolve_family(sock, NFSD_FAMILY_NAME, L_ERROR);
+		}
+	}
+	return nfsd_nl_family;
+}
+
+static int getpolicy_handler(struct nl_msg *msg, void *arg)
+{
+	struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
+	struct nlattr *attr;
+	int rem;
+
+	nla_for_each_attr(attr, genlmsg_attrdata(gnlh, 0), genlmsg_attrlen(gnlh, 0), rem) {
+		struct nlattr *a, *b;
+		int i, j, index;
+
+		if (nla_type(attr) == CTRL_ATTR_POLICY) {
+			nla_for_each_nested(a, attr, i) {
+				nla_for_each_nested(b, a, j) {
+					int idx = nla_type(b);
+
+					if (nfsd_threads_max_nlattr < idx)
+						nfsd_threads_max_nlattr = idx;
+				}
+			}
+		}
+	}
+	return NL_SKIP;
+}
+
+static int query_nfsd_nl_policy(struct nl_sock *sock)
+{
+	struct genlmsghdr *ghdr;
+	struct nlmsghdr *nlh;
+	struct nl_msg *msg;
+	struct nl_cb *cb;
+	int opt, ret, id;
+
+	if (!nfsd_nl_family_setup(sock))
+		return 1;
+
+	msg = netlink_msg_alloc(sock, GENL_ID_CTRL);
+	if (!msg)
+		return 1;
+
+	nlh = nlmsg_hdr(msg);
+	nlh->nlmsg_flags |= NLM_F_DUMP;
+	ghdr = nlmsg_data(nlh);
+	ghdr->cmd = CTRL_CMD_GETPOLICY;
+
+	cb = nl_cb_alloc(NL_CB_CUSTOM);
+	if (!cb) {
+		xlog(L_ERROR, "failed to allocate netlink callbacks");
+		ret = 1;
+		goto out;
+	}
+
+	nla_put_u16(msg, CTRL_ATTR_FAMILY_ID, nfsd_nl_family);
+	nla_put_u32(msg, CTRL_ATTR_OP, NFSD_CMD_THREADS_SET);
+
+	ret = nl_send_auto(sock, msg);
+	if (ret < 0)
+		goto out_cb;
+
+	ret = 1;
+	nl_cb_err(cb, NL_CB_CUSTOM, error_handler, &ret);
+	nl_cb_set(cb, NL_CB_FINISH, NL_CB_CUSTOM, finish_handler, &ret);
+	nl_cb_set(cb, NL_CB_ACK, NL_CB_CUSTOM, ack_handler, &ret);
+	nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, getpolicy_handler, NULL);
+
+	while (ret > 0)
+		nl_recvmsgs(sock, cb);
+	if (ret < 0) {
+		xlog(L_ERROR, "Error: %s", strerror(-ret));
+		ret = 1;
+	}
+out_cb:
+	nl_cb_put(cb);
+out:
+	nlmsg_free(msg);
+	return ret;
 }
 
 static void status_usage(void)
@@ -484,7 +593,10 @@ static int status_func(struct nl_sock *sock, int argc, char ** argv)
 		}
 	}
 
-	msg = netlink_msg_alloc(sock, NFSD_FAMILY_NAME);
+	if (!nfsd_nl_family_setup(sock))
+		return 1;
+
+	msg = netlink_msg_alloc(sock, nfsd_nl_family);
 	if (!msg)
 		return 1;
 
@@ -532,7 +644,10 @@ static int threads_doit(struct nl_sock *sock, int cmd, int grace, int lease,
 	struct nl_cb *cb;
 	int ret;
 
-	msg = netlink_msg_alloc(sock, NFSD_FAMILY_NAME);
+	if (!nfsd_nl_family_setup(sock))
+		return 1;
+
+	msg = netlink_msg_alloc(sock, nfsd_nl_family);
 	if (!msg)
 		return 1;
 
@@ -546,10 +661,8 @@ static int threads_doit(struct nl_sock *sock, int cmd, int grace, int lease,
 			nla_put_u32(msg, NFSD_A_SERVER_LEASETIME, lease);
 		if (scope)
 			nla_put_string(msg, NFSD_A_SERVER_SCOPE, scope);
-#if HAVE_DECL_NFSD_A_SERVER_MIN_THREADS
 		if (minthreads >= 0)
 			nla_put_u32(msg, NFSD_A_SERVER_MIN_THREADS, minthreads);
-#endif
 		for (i = 0; i < pool_count; ++i)
 			nla_put_u32(msg, NFSD_A_SERVER_THREADS, pool_threads[i]);
 	}
@@ -591,24 +704,16 @@ out:
 static void threads_usage(void)
 {
 	printf("Usage: %s threads { --min-threads=X } [ pool0_count ] [ pool1_count ] ...\n", taskname);
-#if HAVE_DECL_NFSD_A_SERVER_MIN_THREADS
 	printf("    --min-threads= set the minimum thread count per pool to value\n");
-#endif
 	printf("    pool0_count: thread count for pool0, etc...\n");
 	printf("Omit any arguments to show current thread counts.\n");
 }
 
-#if HAVE_DECL_NFSD_A_SERVER_MIN_THREADS
 static const struct option threads_options[] = {
 	{ "help", no_argument, NULL, 'h' },
 	{ "min-threads", required_argument, NULL, 'm' },
 	{ },
 };
-#define THREADS_OPTSTRING "hm:"
-#else
-#define threads_options help_only_options
-#define THREADS_OPTSTRING "h"
-#endif
 
 static int threads_func(struct nl_sock *sock, int argc, char **argv)
 {
@@ -618,13 +723,17 @@ static int threads_func(struct nl_sock *sock, int argc, char **argv)
 	int opt, pools = 0;
 
 	optind = 1;
-	while ((opt = getopt_long(argc, argv, THREADS_OPTSTRING, threads_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "hm:", threads_options, NULL)) != -1) {
 		switch (opt) {
 		case 'h':
 			threads_usage();
 			return 0;
-#if HAVE_DECL_NFSD_A_SERVER_MIN_THREADS
 		case 'm':
+			if (nfsd_threads_max_nlattr < NFSD_A_SERVER_MIN_THREADS) {
+				xlog(L_ERROR, "This kernel does not support dynamic threading.");
+				return 1;
+			}
+
 			errno = 0;
 			minthreads = strtoul(optarg, NULL, 0);
 			if (minthreads == ULONG_MAX && errno != 0) {
@@ -632,7 +741,6 @@ static int threads_func(struct nl_sock *sock, int argc, char **argv)
 				return 1;
 			}
 			break;
-#endif
 		}
 	}
 
@@ -674,7 +782,10 @@ static int fetch_nfsd_versions(struct nl_sock *sock)
 	struct nl_cb *cb;
 	int ret;
 
-	msg = netlink_msg_alloc(sock, NFSD_FAMILY_NAME);
+	if (!nfsd_nl_family_setup(sock))
+		return 1;
+
+	msg = netlink_msg_alloc(sock, nfsd_nl_family);
 	if (!msg)
 		return 1;
 
@@ -739,7 +850,10 @@ static int set_nfsd_versions(struct nl_sock *sock)
 	struct nl_cb *cb;
 	int i, ret;
 
-	msg = netlink_msg_alloc(sock, NFSD_FAMILY_NAME);
+	if (!nfsd_nl_family_setup(sock))
+		return 1;
+
+	msg = netlink_msg_alloc(sock, nfsd_nl_family);
 	if (!msg)
 		return 1;
 
@@ -920,7 +1034,10 @@ static int fetch_current_listeners(struct nl_sock *sock)
 	struct nl_cb *cb;
 	int ret;
 
-	msg = netlink_msg_alloc(sock, NFSD_FAMILY_NAME);
+	if (!nfsd_nl_family_setup(sock))
+		return 1;
+
+	msg = netlink_msg_alloc(sock, nfsd_nl_family);
 	if (!msg)
 		return 1;
 
@@ -1165,7 +1282,10 @@ static int set_listeners(struct nl_sock *sock)
 	struct nl_cb *cb;
 	int i, ret;
 
-	msg = netlink_msg_alloc(sock, NFSD_FAMILY_NAME);
+	if (!nfsd_nl_family_setup(sock))
+		return 1;
+
+	msg = netlink_msg_alloc(sock, nfsd_nl_family);
 	if (!msg)
 		return 1;
 
@@ -1286,7 +1406,10 @@ static int pool_mode_doit(struct nl_sock *sock, int cmd, const char *pool_mode)
 	struct nl_cb *cb;
 	int ret;
 
-	msg = netlink_msg_alloc(sock, NFSD_FAMILY_NAME);
+	if (!nfsd_nl_family_setup(sock))
+		return 1;
+
+	msg = netlink_msg_alloc(sock, nfsd_nl_family);
 	if (!msg)
 		return 1;
 
@@ -1379,7 +1502,10 @@ static int lockd_config_doit(struct nl_sock *sock, int cmd, int grace, int tcppo
 			return 0;
 	}
 
-	msg = netlink_msg_alloc(sock, LOCKD_FAMILY_NAME);
+	if (!lockd_nl_family_setup(sock))
+		return 1;
+
+	msg = netlink_msg_alloc(sock, lockd_nl_family);
 	if (!msg)
 		return 1;
 
@@ -1398,14 +1524,14 @@ static int lockd_config_doit(struct nl_sock *sock, int cmd, int grace, int tcppo
 
 	cb = nl_cb_alloc(NL_CB_CUSTOM);
 	if (!cb) {
-		xlog(L_ERROR, "failed to allocate netlink callbacks\n");
+		xlog(L_ERROR, "failed to allocate netlink callbacks");
 		ret = 1;
 		goto out;
 	}
 
 	ret = nl_send_auto(sock, msg);
 	if (ret < 0) {
-		xlog(L_ERROR, "send failed (%d)!\n", ret);
+		xlog(L_ERROR, "send failed (%d)!", ret);
 		goto out_cb;
 	}
 
@@ -1418,7 +1544,7 @@ static int lockd_config_doit(struct nl_sock *sock, int cmd, int grace, int tcppo
 	while (ret > 0)
 		nl_recvmsgs(sock, cb);
 	if (ret < 0) {
-		xlog(L_ERROR, "Error: %s\n", strerror(-ret));
+		xlog(L_ERROR, "Error: %s", strerror(-ret));
 		ret = 1;
 	}
 out_cb:
@@ -1438,7 +1564,7 @@ static int get_service(const char *svc)
 
 	ret = getaddrinfo(NULL, svc, &hints, &res);
 	if (ret) {
-		xlog(L_ERROR, "getaddrinfo of \"%s\" failed: %s\n",
+		xlog(L_ERROR, "getaddrinfo of \"%s\" failed: %s",
 			svc, gai_strerror(ret));
 		return -1;
 	}
@@ -1459,7 +1585,7 @@ static int get_service(const char *svc)
 		}
 		break;
 	default:
-		xlog(L_ERROR, "Bad address family: %d\n", res->ai_family);
+		xlog(L_ERROR, "Bad address family: %d", res->ai_family);
 		port = -1;
 	}
 	freeaddrinfo(res);
@@ -1712,7 +1838,12 @@ static int autostart_func(struct nl_sock *sock, int argc, char ** argv)
 
 	lease = conf_get_num("nfsd", "lease-time", 0);
 	scope = conf_get_str("nfsd", "scope");
-	minthreads = conf_get_num("nfsd", "min-threads", 0);
+	minthreads = conf_get_num("nfsd", "min-threads", -1);
+
+	if (minthreads >= 0 && nfsd_threads_max_nlattr < NFSD_A_SERVER_MIN_THREADS) {
+		xlog(L_WARNING, "This kernel does not support dynamic threading. min-threads setting ignored.");
+		minthreads = -1;
+	}
 
 	ret = threads_doit(sock, NFSD_CMD_THREADS_SET, grace, lease, pools,
 			   threads, scope, minthreads);
@@ -1904,6 +2035,9 @@ int main(int argc, char **argv)
 		xlog(L_ERROR, "Unable to allocate netlink socket!");
 		return 1;
 	}
+
+	if (query_nfsd_nl_policy(sock))
+		return 1;
 
 	if (optind > argc) {
 		usage();
