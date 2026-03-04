@@ -266,7 +266,7 @@ Recognized values:
 .BR use-machine-creds ,
 .BR use-gss-proxy ,
 .BR avoid-dns ,
-.BR limit-to-legacy-enctypes ,
+.BR allowed-enctypes ,
 .BR context-timeout ,
 .BR rpc-timeout ,
 .BR keytab-file ,

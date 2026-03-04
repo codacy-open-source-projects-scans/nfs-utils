@@ -16,6 +16,7 @@
 
 #define CONF_NAME "nfsrahead"
 #define NFS_DEFAULT_READAHEAD 128
+#define MNT_NM_TIMEOUT 10000
 
 /* Device information from the system */
 struct device_info {
@@ -117,7 +118,39 @@ out_free_device_info:
 
 static int get_device_info(const char *device_number, struct device_info *device_info)
 {
-	int ret = get_mountinfo(device_number, device_info, MOUNTINFO_PATH);
+	int ret;
+	struct libmnt_monitor *mn = NULL;
+	int timeout_ms = MNT_NM_TIMEOUT;
+
+	ret = get_mountinfo(device_number, device_info, MOUNTINFO_PATH);
+	if (ret == 0)
+		return 0;
+
+	mn = mnt_new_monitor();
+	if (!mn)
+		goto fallback;
+
+	if (mnt_monitor_enable_kernel(mn, 1) < 0) {
+		mnt_unref_monitor(mn);
+		goto fallback;
+	}
+
+	while (timeout_ms > 0) {
+		int rc = mnt_monitor_wait(mn, timeout_ms);
+		if (rc > 0) {
+			ret = get_mountinfo(device_number, device_info, MOUNTINFO_PATH);
+			if (ret == 0) {
+				mnt_unref_monitor(mn);
+				return 0;
+			}
+		} else {
+			break;
+		}
+	}
+	mnt_unref_monitor(mn);
+	return ret;
+
+fallback:
 	for (int retry_count = 0; retry_count < 5 && ret != 0; retry_count++) {
 		usleep(50000);
 		ret = get_mountinfo(device_number, device_info, MOUNTINFO_PATH);
