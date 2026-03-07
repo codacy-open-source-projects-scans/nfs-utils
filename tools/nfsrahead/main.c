@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <unistd.h>
+#include <time.h>
 
 #include <libmount/libmount.h>
 #include <sys/sysmacros.h>
@@ -16,6 +17,7 @@
 
 #define CONF_NAME "nfsrahead"
 #define NFS_DEFAULT_READAHEAD 128
+
 #define MNT_NM_TIMEOUT 10000
 
 /* Device information from the system */
@@ -120,7 +122,17 @@ static int get_device_info(const char *device_number, struct device_info *device
 {
 	int ret;
 	struct libmnt_monitor *mn = NULL;
-	int timeout_ms = MNT_NM_TIMEOUT;
+	struct timespec start, now;
+	int remaining_ms = MNT_NM_TIMEOUT;
+
+	/*
+	 * Fast-path rejection:
+	 * NFS backing devices always use the anonymous block device major number (0).
+	 * If the device number does not start with "0:", it is a physical block device
+	 * and will never be an NFS mount. Exit immediately to prevent blocking udev.
+	 */
+	if (strncmp(device_number, "0:", 2) != 0)
+		return -ENODEV;
 
 	ret = get_mountinfo(device_number, device_info, MOUNTINFO_PATH);
 	if (ret == 0)
@@ -135,8 +147,10 @@ static int get_device_info(const char *device_number, struct device_info *device
 		goto fallback;
 	}
 
-	while (timeout_ms > 0) {
-		int rc = mnt_monitor_wait(mn, timeout_ms);
+	clock_gettime(CLOCK_MONOTONIC, &start);
+
+	while (remaining_ms > 0) {
+		int rc = mnt_monitor_wait(mn, remaining_ms);
 		if (rc > 0) {
 			ret = get_mountinfo(device_number, device_info, MOUNTINFO_PATH);
 			if (ret == 0) {
@@ -146,7 +160,13 @@ static int get_device_info(const char *device_number, struct device_info *device
 		} else {
 			break;
 		}
+
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		long elapsed_ms = (now.tv_sec - start.tv_sec) * 1000 +
+				  (now.tv_nsec - start.tv_nsec) / 1000000;
+		remaining_ms = MNT_NM_TIMEOUT - elapsed_ms;
 	}
+
 	mnt_unref_monitor(mn);
 	return ret;
 
