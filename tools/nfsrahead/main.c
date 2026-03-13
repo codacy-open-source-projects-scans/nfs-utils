@@ -191,7 +191,7 @@ static int conf_get_readahead(const char *kind) {
 int main(int argc, char **argv)
 {
 	int ret = 0, opt;
-	struct device_info device;
+	struct device_info device = { 0 };
 	unsigned int readahead = 128, log_level, log_stderr = 0;
 
 
@@ -218,7 +218,11 @@ int main(int argc, char **argv)
 	if ((argc - optind) != 1)
 		xlog_err("expected the device number of a BDI; is udev ok?");
 
-	if ((ret = get_device_info(argv[optind], &device)) != 0 || device.fstype == NULL) {
+	ret = get_device_info(argv[optind], &device);
+	if (ret == -ENODEV) {
+		xlog(D_ALL, "skipping non-NFS device %s\n", argv[optind]);
+		goto out;
+	} else if (ret != 0 || device.fstype == NULL) {
 		xlog(D_GENERAL, "unable to find device %s\n", argv[optind]);
 		goto out;
 	}
