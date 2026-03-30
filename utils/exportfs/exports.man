@@ -352,6 +352,15 @@ file.  If you put neither option,
 will warn you that the change has occurred.
 
 .TP
+.IR sign_fh
+This option enforces signing filehandles on the export.  If the server has
+been configured with a secret key for such purpose, filehandles will include
+a hash to verify the filehandle was created by the server in order to guard
+against filehandle guessing attacks which can bypass path-name based access
+restrictions.  Note that for NFSv3 some exported filesystems may exceed the
+maximum filehandle size when the signing hash is added.
+
+.TP
 .IR insecure_locks
 .TP
 .IR no_auth_nlm

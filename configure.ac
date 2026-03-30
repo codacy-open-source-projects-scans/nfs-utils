@@ -265,7 +265,8 @@ AC_ARG_ENABLE(nfsdctl,
 
 		# ensure we have the MIN_THREADS attribute
 		AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[#include <linux/nfsd_netlink.h>]],
-				                   [[int foo = NFSD_A_SERVER_MIN_THREADS;]])],
+								   [[int foo = NFSD_A_SERVER_MIN_THREADS;
+								     int bar = NFSD_A_SERVER_FH_KEY;]])],
 				   [AC_DEFINE([USE_SYSTEM_NFSD_NETLINK_H], 1,
 					      ["Use system's linux/nfsd_netlink.h"])])
 		AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[#include <linux/lockd_netlink.h>]],

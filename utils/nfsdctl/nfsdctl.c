@@ -29,6 +29,7 @@
 
 #include <readline/readline.h>
 #include <readline/history.h>
+#include <uuid/uuid.h>
 
 #ifdef USE_SYSTEM_NFSD_NETLINK_H
 #include <linux/nfsd_netlink.h>
@@ -42,6 +43,7 @@
 #include "lockd_netlink.h"
 #endif
 
+#include "nfslib.h"
 #include "nfsdctl.h"
 #include "conffile.h"
 #include "xlog.h"
@@ -161,6 +163,8 @@ static const char *nfsd4_ops[] = {
 	[OP_LISTXATTRS]		= "OP_LISTXATTRS",
 	[OP_REMOVEXATTR]	= "OP_REMOVEXATTR",
 };
+
+static int fetch_current_listeners(struct nl_sock *sock);
 
 static int error_handler(struct sockaddr_nl *nla, struct nlmsgerr *err,
 			 void *arg)
@@ -441,7 +445,6 @@ static struct nl_sock *netlink_sock_alloc(void)
 static struct nl_msg *netlink_msg_alloc(struct nl_sock *sock, int family)
 {
 	struct nl_msg *msg;
-	int id;
 
 	msg = nlmsg_alloc();
 	if (!msg) {
@@ -474,7 +477,7 @@ static int lockd_nl_family_setup(struct nl_sock *sock)
 	if (!lockd_nl_family) {
 		lockd_nl_family = resolve_family(sock, LOCKD_FAMILY_NAME, L_WARNING);
 		if (lockd_nl_family) {
-			system("modprobe lockd");
+			lockd_nl_family = system("modprobe lockd");
 			lockd_nl_family = resolve_family(sock, LOCKD_FAMILY_NAME, L_ERROR);
 		}
 	}
@@ -486,7 +489,7 @@ static int nfsd_nl_family_setup(struct nl_sock *sock)
 	if (!nfsd_nl_family) {
 		nfsd_nl_family = resolve_family(sock, NFSD_FAMILY_NAME, L_WARNING);
 		if (!nfsd_nl_family) {
-			system("modprobe nfsd");
+			nfsd_nl_family = system("modprobe nfsd");
 			nfsd_nl_family = resolve_family(sock, NFSD_FAMILY_NAME, L_ERROR);
 		}
 	}
@@ -501,7 +504,7 @@ static int getpolicy_handler(struct nl_msg *msg, void *arg)
 
 	nla_for_each_attr(attr, genlmsg_attrdata(gnlh, 0), genlmsg_attrlen(gnlh, 0), rem) {
 		struct nlattr *a, *b;
-		int i, j, index;
+		int i, j;
 
 		if (nla_type(attr) == CTRL_ATTR_POLICY) {
 			nla_for_each_nested(a, attr, i) {
@@ -523,7 +526,7 @@ static int query_nfsd_nl_policy(struct nl_sock *sock)
 	struct nlmsghdr *nlh;
 	struct nl_msg *msg;
 	struct nl_cb *cb;
-	int opt, ret, id;
+	int ret;
 
 	if (!nfsd_nl_family_setup(sock))
 		return 1;
@@ -636,8 +639,10 @@ out:
 }
 
 static int threads_doit(struct nl_sock *sock, int cmd, int grace, int lease,
-			int pool_count, int *pool_threads, char *scope, int minthreads)
+			int pool_count, int *pool_threads, char *scope, int minthreads,
+			uuid_t fh_key)
 {
+	struct nl_data *fh_key_data = NULL;
 	struct genlmsghdr *ghdr;
 	struct nlmsghdr *nlh;
 	struct nl_msg *msg;
@@ -663,6 +668,19 @@ static int threads_doit(struct nl_sock *sock, int cmd, int grace, int lease,
 			nla_put_string(msg, NFSD_A_SERVER_SCOPE, scope);
 		if (minthreads >= 0)
 			nla_put_u32(msg, NFSD_A_SERVER_MIN_THREADS, minthreads);
+		if (!uuid_is_null(fh_key)) {
+			if (nfsd_threads_max_nlattr < NFSD_A_SERVER_FH_KEY) {
+				xlog(L_ERROR, "This kernel does not support signed filehandles.");
+			} else {
+				fh_key_data = nl_data_alloc(fh_key, sizeof(uuid_t));
+				if (!fh_key_data) {
+					xlog(L_ERROR, "failed to allocate netlink data");
+					ret = 1;
+					goto out;
+				}
+				nla_put_data(msg, NFSD_A_SERVER_FH_KEY, fh_key_data);
+			}
+		}
 		for (i = 0; i < pool_count; ++i)
 			nla_put_u32(msg, NFSD_A_SERVER_THREADS, pool_threads[i]);
 	}
@@ -697,14 +715,17 @@ static int threads_doit(struct nl_sock *sock, int cmd, int grace, int lease,
 out_cb:
 	nl_cb_put(cb);
 out:
+	if (fh_key_data)
+		nl_data_free(fh_key_data);
 	nlmsg_free(msg);
 	return ret;
 }
 
 static void threads_usage(void)
 {
-	printf("Usage: %s threads { --min-threads=X } [ pool0_count ] [ pool1_count ] ...\n", taskname);
+	printf("Usage: %s threads { --min-threads=X } { --fh-key-file=file } [ pool0_count ] [ pool1_count ] ...\n", taskname);
 	printf("    --min-threads= set the minimum thread count per pool to value\n");
+	printf("    --fh-key-file= path to a file to set the filehandle signing key\n");
 	printf("    pool0_count: thread count for pool0, etc...\n");
 	printf("Omit any arguments to show current thread counts.\n");
 }
@@ -712,6 +733,7 @@ static void threads_usage(void)
 static const struct option threads_options[] = {
 	{ "help", no_argument, NULL, 'h' },
 	{ "min-threads", required_argument, NULL, 'm' },
+	{ "fh-key-file", required_argument, NULL, 'k' },
 	{ },
 };
 
@@ -721,9 +743,12 @@ static int threads_func(struct nl_sock *sock, int argc, char **argv)
 	int *pool_threads = NULL;
 	int minthreads = -1;
 	int opt, pools = 0;
+	uuid_t fh_key;
+	bool zero_threads = false;
 
+	uuid_clear(fh_key);
 	optind = 1;
-	while ((opt = getopt_long(argc, argv, "hm:", threads_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "hm:k:", threads_options, NULL)) != -1) {
 		switch (opt) {
 		case 'h':
 			threads_usage();
@@ -738,6 +763,18 @@ static int threads_func(struct nl_sock *sock, int argc, char **argv)
 			minthreads = strtoul(optarg, NULL, 0);
 			if (minthreads == ULONG_MAX && errno != 0) {
 				fprintf(stderr, "Bad --min-threads value.");
+				return 1;
+			}
+			break;
+		case 'k':
+			if (nfsd_threads_max_nlattr < NFSD_A_SERVER_FH_KEY) {
+				xlog(L_ERROR, "This kernel does not support signed filehandles.\n");
+				return 1;
+			}
+
+			errno = hash_fh_key_file(optarg, fh_key);
+			if (errno) {
+				fprintf(stderr, "Error hashing key file %s: %s.", optarg, strerror(errno));
 				return 1;
 			}
 			break;
@@ -762,13 +799,33 @@ static int threads_func(struct nl_sock *sock, int argc, char **argv)
 			}
 
 			pool_threads[i] = strtol(targv[i], &endptr, 0);
+			if (!pool_threads[i])
+				zero_threads = true;
 			if (!endptr || *endptr != '\0') {
 				xlog(L_ERROR, "Invalid threads value %s.", argv[1]);
 				return 1;
 			}
 		}
 	}
-	return threads_doit(sock, cmd, 0, 0, pools, pool_threads, NULL, minthreads);
+	/* check if there are active listeners added */
+	if (fetch_current_listeners(sock)) {
+		xlog(L_ERROR, "Unable to determine if listeners were added");
+		return 1;
+	}
+	if (!nfsd_socket_count) {
+		if (zero_threads) {
+			/* Note: we can never have a server with threads and no
+			 * listener. If we ever add functionality to remove
+			 * listeners on an active server, we need to revisit this.
+			 */
+			return 0;
+		}
+		xlog(L_ERROR, "No active listeners added, not starting threads");
+		return 1;
+	}
+
+	return threads_doit(sock, cmd, 0, 0, pools, pool_threads, NULL,
+				minthreads, fh_key);
 }
 
 /*
@@ -1760,8 +1817,9 @@ static int autostart_func(struct nl_sock *sock, int argc, char ** argv)
 	int *threads, grace, lease, idx, ret, opt, pools, minthreads;
 	struct conf_list *thread_str;
 	struct conf_list_node *n;
-	char *scope, *pool_mode;
+	char *scope, *pool_mode, *fh_key_file;
 	bool failed_listeners = false;
+	uuid_t fh_key;
 
 	optind = 1;
 	while ((opt = getopt_long(argc, argv, "h", help_only_options, NULL)) != -1) {
@@ -1836,6 +1894,14 @@ static int autostart_func(struct nl_sock *sock, int argc, char ** argv)
 		threads[0] = DEFAULT_AUTOSTART_THREADS;
 	}
 
+	uuid_clear(fh_key);
+	fh_key_file = conf_get_str("nfsd", "fh-key-file");
+	if (fh_key_file) {
+		ret = hash_fh_key_file(fh_key_file, fh_key);
+		if (ret)
+			return ret;
+	}
+
 	lease = conf_get_num("nfsd", "lease-time", 0);
 	scope = conf_get_str("nfsd", "scope");
 	minthreads = conf_get_num("nfsd", "min-threads", -1);
@@ -1846,7 +1912,7 @@ static int autostart_func(struct nl_sock *sock, int argc, char ** argv)
 	}
 
 	ret = threads_doit(sock, NFSD_CMD_THREADS_SET, grace, lease, pools,
-			   threads, scope, minthreads);
+			   threads, scope, minthreads, fh_key);
 out:
 	free(threads);
 	return ret;

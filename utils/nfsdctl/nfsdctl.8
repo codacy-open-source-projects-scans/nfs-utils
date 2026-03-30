@@ -159,6 +159,12 @@ These options are specific to the "threads" subcommand:
     kernel will start the minimum number and dynamically start and stop threads as
     needed. If the minimum is larger than the maximum, then dynamic threadis is
     disabled, and the maximum number is started.
+
+\-k, \-\-fh\-key\-file=
+    If set to the path of a file, use the first 128 bits of the sha1 hash
+    of the file's contents as the server's filehandle signing key.
+    Exports with the "sign_fh" export option will use this key to append an
+    a signature to guard against filehandle guessing attacks.
 .fam
 .fi
 .if n .RE
