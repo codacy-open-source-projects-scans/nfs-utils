@@ -53,39 +53,41 @@ by using the
 command.
 .PP
 .B exportfs
-and its partner program
-.B rpc.mountd
-work in one of two modes: a legacy mode which applies to 2.4 and
-earlier versions of the Linux kernel, and a new mode which applies to
-2.6 and later versions, providing the
-.B nfsd
-virtual filesystem has been mounted at
-.I /proc/fs/nfsd
-or
-.IR /proc/fs/nfs .
-On 2.6 kernels, if this filesystem is not mounted, the legacy mode is used.
-.PP
-In the new mode,
-.B exportfs
-does not give any information to the kernel, but provides it only to
-.B rpc.mountd
-through the
+does not communicate with the kernel directly.
+It writes export information to
 .I /var/lib/nfs/etab
-file.
+and relies on its partner programs
 .B rpc.mountd
-then manages kernel requests for information about exports, as needed.
+and
+.B nfsv4.exportd
+to manage kernel communication.
+These daemons work in one of two modes: a netlink mode and a
+.I /proc
+mode.
 .PP
-In the legacy mode,
-exports which identify a specific host, rather than a subnet or netgroup,
-are entered directly into the kernel's export table,
-as well as being written to
-.IR /var/lib/nfs/etab .
-Further, exports listed in
-.I /var/lib/nfs/rmtab
-which match a non host-specific export request will cause an
-appropriate export entry for the host given in
-.I rmtab
-to be added to the kernel's export table.
+In the netlink mode, available on sufficiently recent kernels,
+.B rpc.mountd
+(or
+.BR nfsv4.exportd )
+communicates with the kernel via generic netlink sockets.
+The kernel sends multicast notifications when cache entries need to be
+resolved, and the daemon responds with the appropriate export
+information.
+Cache flushing (via
+.BR "exportfs \-f" )
+is also performed over netlink.
+This mode can be disabled with the
+.B \-L
+option.
+.PP
+In the
+.I /proc
+mode, used when netlink is unavailable,
+.B rpc.mountd
+manages kernel requests for information about exports
+via the
+.I /proc/net/rpc
+channel files.
 .SH OPTIONS
 .TP
 .B \-d kind " or " \-\-debug kind
@@ -148,6 +150,12 @@ options.
 .TP
 .B -s
 Display the current export list suitable for /etc/exports.
+.TP
+.B -L
+Disable the use of netlink for kernel communication and force the use
+of the legacy
+.I /proc
+interfaces for cache flushing and export validation.
 
 .SH CONFIGURATION FILE
 The
@@ -167,11 +175,20 @@ When a list is given, the members should be comma-separated.
 .B exportfs
 will also recognize the
 .B state-directory-path
-value from both the 
+and
+.B no\-netlink
+values from both the
 .B [mountd]
 section and the
 .B [exportd]
-section
+section.
+When
+.B no\-netlink
+is set,
+.B exportfs
+will skip the netlink probe and use the legacy
+.I /proc
+interfaces for cache flushing and export validation
 
 .SH DISCUSSION
 .SS Exporting Directories

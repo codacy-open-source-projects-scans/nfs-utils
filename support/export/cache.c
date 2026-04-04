@@ -36,6 +36,24 @@
 #include "reexport.h"
 #include "fsloc.h"
 
+#include <netlink/genl/genl.h>
+#include <netlink/genl/ctrl.h>
+#include <netlink/msg.h>
+#include <netlink/attr.h>
+#include <linux/netlink.h>
+
+#ifdef USE_SYSTEM_NFSD_NETLINK_H
+#include <linux/nfsd_netlink.h>
+#else
+#include "nfsd_netlink.h"
+#endif
+
+#ifdef USE_SYSTEM_SUNRPC_NETLINK_H
+#include <linux/sunrpc_netlink.h>
+#else
+#include "sunrpc_netlink.h"
+#endif
+
 #ifdef USE_BLKID
 #include "blkid/blkid.h"
 #endif
@@ -92,6 +110,8 @@ static bool path_lookup_error(int err)
 #define INITIAL_MANAGED_GROUPS 100
 
 extern int use_ipaddr;
+extern int manage_gids;
+extern int no_netlink;
 
 static void auth_unix_ip(int f)
 {
@@ -810,7 +830,10 @@ static int nfsd_handle_fh(int f, char *bp, int blen)
 
 	/* Now determine export point for this fsid/domain */
 	for (i=0 ; i < MCL_MAXTYPES; i++) {
+		nfs_export *prev = NULL;
 		nfs_export *next_exp;
+		void *mnt = NULL;
+
 		for (exp = exportlist[i].p_head; exp; exp = next_exp) {
 			char *path;
 
@@ -820,9 +843,6 @@ static int nfsd_handle_fh(int f, char *bp, int blen)
 			}
 
 			if (exp->m_export.e_flags & NFSEXP_CROSSMOUNT) {
-				static nfs_export *prev = NULL;
-				static void *mnt = NULL;
-				
 				if (prev == exp) {
 					/* try a submount */
 					path = next_mnt(&mnt, exp->m_export.e_path);
@@ -1050,6 +1070,1435 @@ static void write_xprtsec(char **bp, int *blen, struct exportent *ep)
 	qword_addint(bp, blen, p - ep->e_xprtsec);
 	for (p = ep->e_xprtsec; p->info; p++)
 		qword_addint(bp, blen, p->info->number);
+}
+
+/*
+ * Netlink-based svc_export cache support.
+ *
+ * The kernel can notify userspace of pending export cache requests via
+ * the "exportd" genetlink multicast group. We listen for
+ * NFSD_CMD_SVC_EXPORT_NOTIFY, then issue NFSD_CMD_SVC_EXPORT_GET_REQS
+ * to retrieve pending requests, resolve them, and respond with
+ * NFSD_CMD_SVC_EXPORT_SET_REQS.
+ */
+static nfs_export *lookup_export(char *dom, char *path, struct addrinfo *ai);
+static struct nl_msg *cache_nl_new_msg(int family, int cmd, int flags);
+
+static struct nl_sock *nfsd_nl_notify_sock;	/* multicast notifications */
+static struct nl_sock *nfsd_nl_cmd_sock;	/* GET_REQS / SET_REQS commands */
+static int nfsd_nl_family;
+
+#define NL_BUFFER_SIZE	65536
+
+struct export_req {
+	char	*client;
+	char	*path;
+};
+
+static struct nl_sock *nl_sock_setup(void)
+{
+	struct nl_sock *sock;
+	int val = 1;
+
+	sock = nl_socket_alloc();
+	if (!sock)
+		return NULL;
+
+	if (genl_connect(sock)) {
+		nl_socket_free(sock);
+		return NULL;
+	}
+
+	nl_socket_set_buffer_size(sock, NL_BUFFER_SIZE, NL_BUFFER_SIZE);
+	setsockopt(nl_socket_get_fd(sock), SOL_NETLINK, NETLINK_EXT_ACK,
+		   &val, sizeof(val));
+
+	return sock;
+}
+
+static int cache_genl_open(const char *family_name, const char *mcgrp_name,
+			   struct nl_sock **cmd_sock,
+			   struct nl_sock **notify_sock, int *family_out)
+{
+	int grp;
+
+	*family_out = 0;
+
+	*cmd_sock = nl_sock_setup();
+	if (!*cmd_sock) {
+		xlog(D_NETLINK, "%s: failed to allocate command socket",
+		     family_name);
+		return -ENOMEM;
+	}
+
+	*family_out = genl_ctrl_resolve(*cmd_sock, family_name);
+	if (*family_out < 0) {
+		xlog(D_NETLINK, "%s: netlink family not found", family_name);
+		goto out_free_cmd;
+	}
+
+	grp = genl_ctrl_resolve_grp(*cmd_sock, family_name, mcgrp_name);
+	if (grp < 0) {
+		xlog(D_NETLINK, "%s: %s multicast group not found",
+		     family_name, mcgrp_name);
+		goto out_free_cmd;
+	}
+
+	*notify_sock = nl_sock_setup();
+	if (!*notify_sock) {
+		xlog(D_NETLINK, "%s: failed to allocate notify socket",
+		     family_name);
+		goto out_free_cmd;
+	}
+
+	nl_socket_disable_seq_check(*notify_sock);
+
+	if (nl_socket_add_membership(*notify_sock, grp)) {
+		xlog(L_WARNING, "%s: failed to join %s multicast group",
+		     family_name, mcgrp_name);
+		goto out_free_notify;
+	}
+
+	nl_socket_set_nonblocking(*notify_sock);
+	xlog(D_NETLINK, "%s: listening for %s notifications",
+	     family_name, mcgrp_name);
+	return 0;
+
+out_free_notify:
+	nl_socket_free(*notify_sock);
+	*notify_sock = NULL;
+out_free_cmd:
+	nl_socket_free(*cmd_sock);
+	*cmd_sock = NULL;
+	*family_out = 0;
+	return -ENOENT;
+}
+
+static int cache_nfsd_nl_open(void)
+{
+	return cache_genl_open(NFSD_FAMILY_NAME, NFSD_MCGRP_EXPORTD,
+			       &nfsd_nl_cmd_sock, &nfsd_nl_notify_sock,
+			       &nfsd_nl_family);
+}
+
+static int nl_seq_check_handler(struct nl_msg *UNUSED(msg), void *UNUSED(arg))
+{
+	return NL_OK;
+}
+
+static int nfsd_notify_handler(struct nl_msg *msg, void *arg)
+{
+	unsigned int *cache_mask = arg;
+	struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
+	struct nlattr *tb[NFSD_A_CACHE_NOTIFY_MAX + 1];
+
+	if (nla_parse(tb, NFSD_A_CACHE_NOTIFY_MAX,
+		      genlmsg_attrdata(gnlh, 0),
+		      genlmsg_attrlen(gnlh, 0), NULL) == 0 &&
+	    tb[NFSD_A_CACHE_NOTIFY_CACHE_TYPE])
+		*cache_mask |= nla_get_u32(tb[NFSD_A_CACHE_NOTIFY_CACHE_TYPE]);
+	else
+		*cache_mask = ~0U;
+
+	xlog(D_NETLINK, "nfsd_notify_handler: cache_mask=%x", *cache_mask);
+	return NL_OK;
+}
+
+static unsigned int cache_nfsd_nl_drain(void)
+{
+	unsigned int cache_mask = 0;
+	struct nl_cb *cb;
+
+	cb = nl_cb_alloc(NL_CB_DEFAULT);
+	if (!cb)
+		return ~0U;
+
+	nl_cb_set(cb, NL_CB_SEQ_CHECK, NL_CB_CUSTOM,
+		  nl_seq_check_handler, NULL);
+	nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, nfsd_notify_handler,
+		  &cache_mask);
+	nl_recvmsgs(nfsd_nl_notify_sock, cb);
+	nl_cb_put(cb);
+	return cache_mask;
+}
+
+struct get_export_reqs_data {
+	struct export_req	*reqs;
+	int			nreqs;
+	int			maxreqs;
+	int			err;
+};
+
+static int get_export_reqs_cb(struct nl_msg *msg, void *arg)
+{
+	struct get_export_reqs_data *data = arg;
+	struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
+	struct nlattr *attr;
+	int rem;
+
+	nla_for_each_attr(attr, genlmsg_attrdata(gnlh, 0),
+			  genlmsg_attrlen(gnlh, 0), rem) {
+		struct nlattr *tb[NFSD_A_SVC_EXPORT_PATH + 1];
+		struct export_req *req;
+
+		if (nla_type(attr) != NFSD_A_SVC_EXPORT_REQS_REQUESTS)
+			continue;
+
+		if (nla_parse_nested(tb, NFSD_A_SVC_EXPORT_PATH, attr,
+				     NULL))
+			continue;
+
+		if (!tb[NFSD_A_SVC_EXPORT_CLIENT] ||
+		    !tb[NFSD_A_SVC_EXPORT_PATH])
+			continue;
+
+		if (data->nreqs >= data->maxreqs) {
+			int newmax = data->maxreqs ? data->maxreqs * 2 : 16;
+			struct export_req *tmp;
+
+			tmp = realloc(data->reqs,
+				      newmax * sizeof(*tmp));
+			if (!tmp) {
+				data->err = -ENOMEM;
+				return NL_STOP;
+			}
+			data->reqs = tmp;
+			data->maxreqs = newmax;
+		}
+
+		req = &data->reqs[data->nreqs++];
+		req->client = strdup(nla_get_string(tb[NFSD_A_SVC_EXPORT_CLIENT]));
+		req->path = strdup(nla_get_string(tb[NFSD_A_SVC_EXPORT_PATH]));
+
+		if (!req->client || !req->path) {
+			data->err = -ENOMEM;
+			return NL_STOP;
+		}
+	}
+
+	return NL_OK;
+}
+
+static int nl_finish_cb(struct nl_msg *UNUSED(msg), void *arg)
+{
+	int *done = arg;
+
+	*done = 1;
+	return NL_STOP;
+}
+
+static int nl_error_cb(struct sockaddr_nl *UNUSED(nla),
+		       struct nlmsgerr *UNUSED(nlerr), void *arg)
+{
+	int *done = arg;
+
+	*done = 1;
+	return NL_STOP;
+}
+
+static int cache_nl_get_export_reqs(struct export_req **reqs_out, int *nreqs_out)
+{
+	struct get_export_reqs_data data = { };
+	struct nl_msg *msg;
+	struct nl_cb *cb;
+	int done = 0;
+	int ret;
+
+	msg = cache_nl_new_msg(nfsd_nl_family,
+			       NFSD_CMD_SVC_EXPORT_GET_REQS, NLM_F_DUMP);
+	if (!msg)
+		return -ENOMEM;
+
+	cb = nl_cb_alloc(NL_CB_DEFAULT);
+	if (!cb) {
+		nlmsg_free(msg);
+		return -ENOMEM;
+	}
+
+	nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, get_export_reqs_cb, &data);
+	nl_cb_set(cb, NL_CB_FINISH, NL_CB_CUSTOM, nl_finish_cb, &done);
+	nl_cb_err(cb, NL_CB_CUSTOM, nl_error_cb, &done);
+
+	ret = nl_send_auto(nfsd_nl_cmd_sock, msg);
+	nlmsg_free(msg);
+	if (ret < 0) {
+		nl_cb_put(cb);
+		return ret;
+	}
+
+	while (!done) {
+		ret = nl_recvmsgs(nfsd_nl_cmd_sock, cb);
+		if (ret < 0)
+			break;
+	}
+
+	nl_cb_put(cb);
+
+	if (data.err) {
+		int i;
+		for (i = 0; i < data.nreqs; i++) {
+			free(data.reqs[i].client);
+			free(data.reqs[i].path);
+		}
+		free(data.reqs);
+		return data.err;
+	}
+
+	*reqs_out = data.reqs;
+	*nreqs_out = data.nreqs;
+	return 0;
+}
+
+static int nfsd_nl_add_fsloc(struct nl_msg *msg, struct exportent *ep)
+{
+	struct servers *servers;
+	struct nlattr *fslocs;
+	int i;
+
+	if (ep->e_fslocmethod == FSLOC_NONE)
+		return 0;
+
+	servers = replicas_lookup(ep->e_fslocmethod, ep->e_fslocdata);
+	if (!servers)
+		return 0;
+
+	if (servers->h_num < 0) {
+		release_replicas(servers);
+		return 0;
+	}
+
+	fslocs = nla_nest_start(msg, NFSD_A_SVC_EXPORT_FSLOCATIONS);
+	if (!fslocs) {
+		release_replicas(servers);
+		return -1;
+	}
+
+	for (i = 0; i < servers->h_num; i++) {
+		struct nlattr *loc;
+
+		loc = nla_nest_start(msg, NFSD_A_FSLOCATIONS_LOCATION);
+		if (!loc) {
+			release_replicas(servers);
+			return -1;
+		}
+
+		if (nla_put_string(msg, NFSD_A_FSLOCATION_HOST,
+				   servers->h_mp[i]->h_host) < 0 ||
+		    nla_put_string(msg, NFSD_A_FSLOCATION_PATH,
+				   servers->h_mp[i]->h_path) < 0) {
+			nla_nest_cancel(msg, fslocs);
+			release_replicas(servers);
+			return -1;
+		}
+		nla_nest_end(msg, loc);
+	}
+
+	nla_nest_end(msg, fslocs);
+	release_replicas(servers);
+	return 0;
+}
+
+static int nfsd_nl_add_secinfo(struct nl_msg *msg, struct exportent *ep)
+{
+	struct sec_entry *p;
+
+	for (p = ep->e_secinfo; p->flav; p++)
+		; /* count */
+	if (p == ep->e_secinfo)
+		return 0;
+
+	fix_pseudoflavor_flags(ep);
+	for (p = ep->e_secinfo; p->flav; p++) {
+		struct nlattr *sec;
+
+		sec = nla_nest_start(msg, NFSD_A_SVC_EXPORT_SECINFO);
+		if (!sec)
+			return -1;
+
+		if (nla_put_u32(msg, NFSD_A_AUTH_FLAVOR_PSEUDOFLAVOR,
+				p->flav->fnum) < 0 ||
+		    nla_put_u32(msg, NFSD_A_AUTH_FLAVOR_FLAGS,
+				p->flags) < 0)
+			return -1;
+		nla_nest_end(msg, sec);
+	}
+
+	return 0;
+}
+
+static int nfsd_nl_add_xprtsec(struct nl_msg *msg, struct exportent *ep)
+{
+	struct xprtsec_entry *p;
+
+	for (p = ep->e_xprtsec; p->info; p++)
+		;
+	if (p == ep->e_xprtsec)
+		return 0;
+
+	for (p = ep->e_xprtsec; p->info; p++)
+		if (nla_put_u32(msg, NFSD_A_SVC_EXPORT_XPRTSEC,
+				p->info->number) < 0)
+			return -1;
+
+	return 0;
+}
+
+static int nfsd_nl_add_export(struct nl_msg *msg, char *domain, char *path,
+			 struct exportent *exp, int ttl)
+{
+	struct nlattr *nest;
+	time_t now = time(0);
+	char u[16];
+
+	if (ttl <= 1)
+		ttl = default_ttl;
+
+	nest = nla_nest_start(msg, NFSD_A_SVC_EXPORT_REQS_REQUESTS);
+	if (!nest)
+		return -1;
+
+	if (nla_put_string(msg, NFSD_A_SVC_EXPORT_CLIENT, domain) < 0 ||
+	    nla_put_string(msg, NFSD_A_SVC_EXPORT_PATH, path) < 0 ||
+	    nla_put_u64(msg, NFSD_A_SVC_EXPORT_EXPIRY, now + ttl) < 0)
+		goto nla_failure;
+
+	if (!exp) {
+		if (nla_put_flag(msg, NFSD_A_SVC_EXPORT_NEGATIVE) < 0)
+			goto nla_failure;
+	} else {
+		if (nla_put_u32(msg, NFSD_A_SVC_EXPORT_ANON_UID,
+				exp->e_anonuid) < 0 ||
+		    nla_put_u32(msg, NFSD_A_SVC_EXPORT_ANON_GID,
+				exp->e_anongid) < 0 ||
+		    nla_put_u32(msg, NFSD_A_SVC_EXPORT_FLAGS,
+				exp->e_flags) < 0 ||
+		    nla_put_s32(msg, NFSD_A_SVC_EXPORT_FSID,
+				exp->e_fsid) < 0)
+			goto nla_failure;
+
+		if (nfsd_nl_add_fsloc(msg, exp))
+			goto nla_failure;
+
+		if (exp->e_uuid) {
+			get_uuid(exp->e_uuid, 16, u);
+			if (nla_put(msg, NFSD_A_SVC_EXPORT_UUID,
+				    16, u) < 0)
+				goto nla_failure;
+		} else if (uuid_by_path(path, 0, 16, u)) {
+			if (nla_put(msg, NFSD_A_SVC_EXPORT_UUID,
+				    16, u) < 0)
+				goto nla_failure;
+		}
+
+		if (nfsd_nl_add_secinfo(msg, exp))
+			goto nla_failure;
+
+		if (nfsd_nl_add_xprtsec(msg, exp))
+			goto nla_failure;
+	}
+
+	nla_nest_end(msg, nest);
+	return 0;
+
+nla_failure:
+	nla_nest_cancel(msg, nest);
+	return -1;
+}
+
+static struct nl_msg *cache_nl_new_msg(int family, int cmd, int flags)
+{
+	struct nl_msg *msg;
+
+	msg = nlmsg_alloc();
+	if (!msg)
+		return NULL;
+
+	if (!genlmsg_put(msg, NL_AUTO_PID, NL_AUTO_SEQ, family,
+			 0, flags, cmd, 0)) {
+		nlmsg_free(msg);
+		return NULL;
+	}
+	return msg;
+}
+
+static int cache_nl_set_reqs(struct nl_sock *sock, struct nl_msg *msg)
+{
+	struct nl_cb *cb;
+	int done = 0;
+	int ret;
+
+	cb = nl_cb_alloc(NL_CB_DEFAULT);
+	if (!cb)
+		return -ENOMEM;
+
+	nl_cb_set(cb, NL_CB_ACK, NL_CB_CUSTOM, nl_finish_cb, &done);
+	nl_cb_err(cb, NL_CB_CUSTOM, nl_error_cb, &done);
+
+	ret = nl_send_auto(sock, msg);
+	if (ret < 0) {
+		nl_cb_put(cb);
+		return ret;
+	}
+
+	while (!done) {
+		ret = nl_recvmsgs(sock, cb);
+		if (ret < 0)
+			break;
+	}
+
+	nl_cb_put(cb);
+	if (ret < 0)
+		xlog(L_WARNING, "%s: SET_REQS failed: %d", __func__, ret);
+	return ret;
+}
+
+static void cache_nl_process_export(void)
+{
+	struct export_req *reqs = NULL;
+	int nreqs = 0;
+	struct nl_msg *msg;
+	int i;
+
+	/* Fetch all pending requests from the kernel */
+	if (cache_nl_get_export_reqs(&reqs, &nreqs)) {
+		xlog(L_WARNING, "cache_nl_process_export: failed to get export requests");
+		return;
+	}
+
+	if (!nreqs)
+		return;
+
+	xlog(D_CALL, "cache_nl_process_export: %d pending export requests", nreqs);
+
+	/* Build the SET_REQS response */
+	msg = cache_nl_new_msg(nfsd_nl_family,
+			       NFSD_CMD_SVC_EXPORT_SET_REQS, 0);
+	if (!msg)
+		goto out_free;
+
+	for (i = 0; i < nreqs; i++) {
+		char *dom = reqs[i].client;
+		char *path = reqs[i].path;
+		struct addrinfo *ai = NULL;
+		nfs_export *found = NULL;
+		struct exportent *epp = NULL;
+		int ttl = 0;
+
+		if (is_ipaddr_client(dom)) {
+			ai = lookup_client_addr(dom);
+			if (!ai)
+				xlog(D_AUTH, "cache_nl_process_export: "
+				     "failed to resolve client %s", dom);
+		}
+
+		if (ai || !is_ipaddr_client(dom))
+			found = lookup_export(dom, path, ai);
+
+		if (found) {
+			char *mp = found->m_export.e_mountpoint;
+
+			if (mp && !*mp)
+				mp = found->m_export.e_path;
+			if (mp && !is_mountpoint(mp)) {
+				xlog(L_WARNING,
+				     "Cannot export path '%s': not a mountpoint",
+				     path);
+				ttl = 60;
+			} else {
+				epp = &found->m_export;
+			}
+		}
+
+		if (nfsd_nl_add_export(msg, dom, path, epp, ttl) < 0) {
+			cache_nl_set_reqs(nfsd_nl_cmd_sock, msg);
+			nlmsg_free(msg);
+			msg = cache_nl_new_msg(nfsd_nl_family,
+					       NFSD_CMD_SVC_EXPORT_SET_REQS, 0);
+			if (!msg) {
+				nfs_freeaddrinfo(ai);
+				goto out_free;
+			}
+			if (nfsd_nl_add_export(msg, dom, path,
+					       epp, ttl) < 0)
+				xlog(L_WARNING, "%s: skipping oversized "
+				     "entry for %s", __func__, path);
+		}
+
+		nfs_freeaddrinfo(ai);
+	}
+
+	cache_nl_set_reqs(nfsd_nl_cmd_sock, msg);
+	nlmsg_free(msg);
+
+out_free:
+	for (i = 0; i < nreqs; i++) {
+		free(reqs[i].client);
+		free(reqs[i].path);
+	}
+	free(reqs);
+}
+
+/*
+ * Netlink-based expkey (nfsd.fh) cache support.
+ *
+ * Uses the same nfsd genl family as svc_export. The kernel sends
+ * NFSD_CMD_CACHE_NOTIFY with NFSD_CACHE_TYPE_EXPKEY to signal
+ * pending expkey cache requests.
+ */
+struct expkey_req {
+	char	*client;
+	int	fsidtype;
+	char	*fsid;
+	int	fsidlen;
+};
+
+struct get_expkey_reqs_data {
+	struct expkey_req	*reqs;
+	int			nreqs;
+	int			maxreqs;
+	int			err;
+};
+
+static int get_expkey_reqs_cb(struct nl_msg *msg, void *arg)
+{
+	struct get_expkey_reqs_data *data = arg;
+	struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
+	struct nlattr *attr;
+	int rem;
+
+	nla_for_each_attr(attr, genlmsg_attrdata(gnlh, 0),
+			  genlmsg_attrlen(gnlh, 0), rem) {
+		struct nlattr *tb[NFSD_A_EXPKEY_PATH + 1];
+		struct expkey_req *req;
+
+		if (nla_type(attr) != NFSD_A_EXPKEY_REQS_REQUESTS)
+			continue;
+
+		if (nla_parse_nested(tb, NFSD_A_EXPKEY_PATH, attr, NULL))
+			continue;
+
+		if (!tb[NFSD_A_EXPKEY_CLIENT] ||
+		    !tb[NFSD_A_EXPKEY_FSIDTYPE] ||
+		    !tb[NFSD_A_EXPKEY_FSID])
+			continue;
+
+		if (data->nreqs >= data->maxreqs) {
+			int newmax = data->maxreqs ? data->maxreqs * 2 : 16;
+			struct expkey_req *tmp;
+
+			tmp = realloc(data->reqs, newmax * sizeof(*tmp));
+			if (!tmp) {
+				data->err = -ENOMEM;
+				return NL_STOP;
+			}
+			data->reqs = tmp;
+			data->maxreqs = newmax;
+		}
+
+		req = &data->reqs[data->nreqs++];
+		req->client = strdup(nla_get_string(tb[NFSD_A_EXPKEY_CLIENT]));
+		req->fsidtype = nla_get_u8(tb[NFSD_A_EXPKEY_FSIDTYPE]);
+		req->fsidlen = nla_len(tb[NFSD_A_EXPKEY_FSID]);
+		req->fsid = malloc(req->fsidlen);
+
+		if (!req->client || !req->fsid) {
+			data->err = -ENOMEM;
+			return NL_STOP;
+		}
+		memcpy(req->fsid, nla_data(tb[NFSD_A_EXPKEY_FSID]),
+		       req->fsidlen);
+	}
+
+	return NL_OK;
+}
+
+static int cache_nl_get_expkey_reqs(struct expkey_req **reqs_out,
+				    int *nreqs_out)
+{
+	struct get_expkey_reqs_data data = { };
+	struct nl_msg *msg;
+	struct nl_cb *cb;
+	int done = 0;
+	int ret;
+
+	msg = cache_nl_new_msg(nfsd_nl_family,
+			       NFSD_CMD_EXPKEY_GET_REQS, NLM_F_DUMP);
+	if (!msg)
+		return -ENOMEM;
+
+	cb = nl_cb_alloc(NL_CB_DEFAULT);
+	if (!cb) {
+		nlmsg_free(msg);
+		return -ENOMEM;
+	}
+
+	nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, get_expkey_reqs_cb, &data);
+	nl_cb_set(cb, NL_CB_FINISH, NL_CB_CUSTOM, nl_finish_cb, &done);
+	nl_cb_err(cb, NL_CB_CUSTOM, nl_error_cb, &done);
+
+	ret = nl_send_auto(nfsd_nl_cmd_sock, msg);
+	nlmsg_free(msg);
+	if (ret < 0) {
+		nl_cb_put(cb);
+		return ret;
+	}
+
+	while (!done) {
+		ret = nl_recvmsgs(nfsd_nl_cmd_sock, cb);
+		if (ret < 0)
+			break;
+	}
+
+	nl_cb_put(cb);
+
+	if (data.err) {
+		int i;
+		for (i = 0; i < data.nreqs; i++) {
+			free(data.reqs[i].client);
+			free(data.reqs[i].fsid);
+		}
+		free(data.reqs);
+		return data.err;
+	}
+
+	*reqs_out = data.reqs;
+	*nreqs_out = data.nreqs;
+	return 0;
+}
+
+static int nfsd_nl_add_expkey(struct nl_msg *msg, char *dom, int fsidtype,
+			 char *fsid, int fsidlen, char *found_path)
+{
+	struct nlattr *nest;
+
+	nest = nla_nest_start(msg, NFSD_A_EXPKEY_REQS_REQUESTS);
+	if (!nest)
+		return -1;
+
+	if (nla_put_string(msg, NFSD_A_EXPKEY_CLIENT, dom) < 0 ||
+	    nla_put_u8(msg, NFSD_A_EXPKEY_FSIDTYPE, fsidtype) < 0 ||
+	    nla_put(msg, NFSD_A_EXPKEY_FSID, fsidlen, fsid) < 0 ||
+	    nla_put_u64(msg, NFSD_A_EXPKEY_EXPIRY, 0x7fffffff) < 0)
+		goto nla_failure;
+
+	if (found_path) {
+		if (nla_put_string(msg, NFSD_A_EXPKEY_PATH,
+				   found_path) < 0)
+			goto nla_failure;
+	} else {
+		if (nla_put_flag(msg, NFSD_A_EXPKEY_NEGATIVE) < 0)
+			goto nla_failure;
+	}
+
+	nla_nest_end(msg, nest);
+	return 0;
+
+nla_failure:
+	nla_nest_cancel(msg, nest);
+	return -1;
+}
+
+static void cache_nl_process_expkey(void)
+{
+	struct expkey_req *reqs = NULL;
+	int nreqs = 0;
+	struct nl_msg *msg;
+	int i;
+
+	if (cache_nl_get_expkey_reqs(&reqs, &nreqs)) {
+		xlog(L_WARNING, "cache_nl_process_expkey: failed to get expkey requests");
+		return;
+	}
+
+	if (!nreqs)
+		return;
+
+	xlog(D_CALL, "cache_nl_process_expkey: %d pending expkey requests", nreqs);
+
+	msg = cache_nl_new_msg(nfsd_nl_family, NFSD_CMD_EXPKEY_SET_REQS, 0);
+	if (!msg)
+		goto out_free;
+
+	for (i = 0; i < nreqs; i++) {
+		char *dom = reqs[i].client;
+		int fsidtype = reqs[i].fsidtype;
+		char *fsid = reqs[i].fsid;
+		int fsidlen = reqs[i].fsidlen;
+		struct parsed_fsid parsed;
+		struct addrinfo *ai = NULL;
+		struct exportent *found = NULL;
+		char *found_path = NULL;
+		nfs_export *exp;
+		int j;
+
+		if (parse_fsid(fsidtype, fsidlen, fsid, &parsed))
+			goto do_add_expkey;
+
+		if (is_ipaddr_client(dom)) {
+			ai = lookup_client_addr(dom);
+			if (!ai)
+				goto do_add_expkey;
+		}
+
+		for (j = 0; j < MCL_MAXTYPES; j++) {
+			nfs_export *prev = NULL;
+			nfs_export *next_exp;
+			void *mnt = NULL;
+
+			for (exp = exportlist[j].p_head; exp;
+			     exp = next_exp) {
+				char *path;
+
+				if (exp->m_export.e_flags &
+				    NFSEXP_CROSSMOUNT) {
+					if (prev == exp) {
+						path = next_mnt(&mnt,
+							exp->m_export.e_path);
+						if (!path) {
+							next_exp = exp->m_next;
+							prev = NULL;
+							continue;
+						}
+						next_exp = exp;
+					} else {
+						prev = exp;
+						mnt = NULL;
+						path = exp->m_export.e_path;
+						next_exp = exp;
+					}
+				} else {
+					path = exp->m_export.e_path;
+					next_exp = exp->m_next;
+				}
+
+				if (!is_ipaddr_client(dom) &&
+				    !namelist_client_matches(exp, dom))
+					continue;
+
+				switch (match_fsid(&parsed, exp, path)) {
+				case 0:
+					continue;
+				case -1:
+					continue;
+				}
+
+				if (is_ipaddr_client(dom) &&
+				    !ipaddr_client_matches(exp, ai))
+					continue;
+
+				if (!found ||
+				    subexport(&exp->m_export, found)) {
+					found = &exp->m_export;
+					free(found_path);
+					found_path = strdup(path);
+					if (!found_path)
+						goto do_add_expkey;
+				}
+			}
+		}
+
+do_add_expkey:
+		if (nfsd_nl_add_expkey(msg, dom, fsidtype, fsid,
+				       fsidlen, found_path) < 0) {
+			cache_nl_set_reqs(nfsd_nl_cmd_sock, msg);
+			nlmsg_free(msg);
+			msg = cache_nl_new_msg(nfsd_nl_family,
+					       NFSD_CMD_EXPKEY_SET_REQS, 0);
+			if (!msg) {
+				free(found_path);
+				nfs_freeaddrinfo(ai);
+				goto out_free;
+			}
+			if (nfsd_nl_add_expkey(msg, dom, fsidtype, fsid,
+					       fsidlen, found_path) < 0)
+				xlog(L_WARNING, "%s: skipping oversized "
+				     "entry", __func__);
+		}
+		if (!found)
+			xlog(D_AUTH, "denied access to %s",
+			     *dom == '$' ? dom + 1 : dom);
+		free(found_path);
+		nfs_freeaddrinfo(ai);
+	}
+
+	cache_nl_set_reqs(nfsd_nl_cmd_sock, msg);
+	nlmsg_free(msg);
+
+out_free:
+	for (i = 0; i < nreqs; i++) {
+		free(reqs[i].client);
+		free(reqs[i].fsid);
+	}
+	free(reqs);
+}
+
+static void cache_nfsd_nl_process(void)
+{
+	unsigned int cache_mask;
+
+	/* Drain pending nfsd notifications */
+	cache_mask = cache_nfsd_nl_drain();
+
+	auth_reload();
+
+	/* Handle any pending svc_export requests */
+	if (cache_mask & NFSD_CACHE_TYPE_SVC_EXPORT)
+		cache_nl_process_export();
+
+	/* Handle any pending expkey requests */
+	if (cache_mask & NFSD_CACHE_TYPE_EXPKEY)
+		cache_nl_process_expkey();
+}
+
+/*
+ * Netlink-based sunrpc cache support.
+ *
+ * The sunrpc genl family handles auth.unix.ip and auth.unix.gid caches.
+ * A SUNRPC_CMD_CACHE_NOTIFY on the "exportd" multicast group signals
+ * pending cache requests.
+ */
+static struct nl_sock *sunrpc_nl_notify_sock;
+static struct nl_sock *sunrpc_nl_cmd_sock;
+static int sunrpc_nl_family;
+
+static int cache_sunrpc_nl_open(void)
+{
+	return cache_genl_open(SUNRPC_FAMILY_NAME, SUNRPC_MCGRP_EXPORTD,
+			       &sunrpc_nl_cmd_sock, &sunrpc_nl_notify_sock,
+			       &sunrpc_nl_family);
+}
+
+static int sunrpc_notify_handler(struct nl_msg *msg, void *arg)
+{
+	unsigned int *cache_mask = arg;
+	struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
+	struct nlattr *tb[SUNRPC_A_CACHE_NOTIFY_MAX + 1];
+
+	if (nla_parse(tb, SUNRPC_A_CACHE_NOTIFY_MAX,
+		      genlmsg_attrdata(gnlh, 0),
+		      genlmsg_attrlen(gnlh, 0), NULL) == 0 &&
+	    tb[SUNRPC_A_CACHE_NOTIFY_CACHE_TYPE])
+		*cache_mask |= nla_get_u32(tb[SUNRPC_A_CACHE_NOTIFY_CACHE_TYPE]);
+	else
+		*cache_mask = ~0U;
+
+	xlog(D_NETLINK, "sunrpc_notify_handler: cache_mask=%x", *cache_mask);
+	return NL_OK;
+}
+
+static unsigned int cache_sunrpc_nl_drain(void)
+{
+	unsigned int cache_mask = 0;
+	struct nl_cb *cb;
+
+	cb = nl_cb_alloc(NL_CB_DEFAULT);
+	if (!cb)
+		return ~0U;
+
+	nl_cb_set(cb, NL_CB_SEQ_CHECK, NL_CB_CUSTOM,
+		  nl_seq_check_handler, NULL);
+	nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, sunrpc_notify_handler,
+		  &cache_mask);
+	nl_recvmsgs(sunrpc_nl_notify_sock, cb);
+	nl_cb_put(cb);
+	return cache_mask;
+}
+
+/*
+ * ip_map (auth.unix.ip) netlink handler
+ */
+struct ip_map_req {
+	char	*class;
+	char	*addr;
+};
+
+struct get_ip_map_reqs_data {
+	struct ip_map_req	*reqs;
+	int			nreqs;
+	int			maxreqs;
+	int			err;
+};
+
+static int get_ip_map_reqs_cb(struct nl_msg *msg, void *arg)
+{
+	struct get_ip_map_reqs_data *data = arg;
+	struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
+	struct nlattr *attr;
+	int rem;
+
+	nla_for_each_attr(attr, genlmsg_attrdata(gnlh, 0),
+			  genlmsg_attrlen(gnlh, 0), rem) {
+		struct nlattr *tb[SUNRPC_A_IP_MAP_EXPIRY + 1];
+		struct ip_map_req *req;
+
+		if (nla_type(attr) != SUNRPC_A_IP_MAP_REQS_REQUESTS)
+			continue;
+
+		if (nla_parse_nested(tb, SUNRPC_A_IP_MAP_EXPIRY, attr,
+				     NULL))
+			continue;
+
+		if (!tb[SUNRPC_A_IP_MAP_CLASS] ||
+		    !tb[SUNRPC_A_IP_MAP_ADDR])
+			continue;
+
+		if (data->nreqs >= data->maxreqs) {
+			int newmax = data->maxreqs ? data->maxreqs * 2 : 16;
+			struct ip_map_req *tmp;
+
+			tmp = realloc(data->reqs, newmax * sizeof(*tmp));
+			if (!tmp) {
+				data->err = -ENOMEM;
+				return NL_STOP;
+			}
+			data->reqs = tmp;
+			data->maxreqs = newmax;
+		}
+
+		req = &data->reqs[data->nreqs++];
+		req->class = strdup(nla_get_string(tb[SUNRPC_A_IP_MAP_CLASS]));
+		req->addr = strdup(nla_get_string(tb[SUNRPC_A_IP_MAP_ADDR]));
+
+		if (!req->class || !req->addr) {
+			data->err = -ENOMEM;
+			return NL_STOP;
+		}
+	}
+
+	return NL_OK;
+}
+
+static int cache_nl_get_ip_map_reqs(struct ip_map_req **reqs_out,
+				    int *nreqs_out)
+{
+	struct get_ip_map_reqs_data data = { };
+	struct nl_msg *msg;
+	struct nl_cb *cb;
+	int done = 0;
+	int ret;
+
+	msg = cache_nl_new_msg(sunrpc_nl_family,
+			       SUNRPC_CMD_IP_MAP_GET_REQS, NLM_F_DUMP);
+	if (!msg)
+		return -ENOMEM;
+
+	cb = nl_cb_alloc(NL_CB_DEFAULT);
+	if (!cb) {
+		nlmsg_free(msg);
+		return -ENOMEM;
+	}
+
+	nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, get_ip_map_reqs_cb, &data);
+	nl_cb_set(cb, NL_CB_FINISH, NL_CB_CUSTOM, nl_finish_cb, &done);
+	nl_cb_err(cb, NL_CB_CUSTOM, nl_error_cb, &done);
+
+	ret = nl_send_auto(sunrpc_nl_cmd_sock, msg);
+	nlmsg_free(msg);
+	if (ret < 0) {
+		nl_cb_put(cb);
+		return ret;
+	}
+
+	while (!done) {
+		ret = nl_recvmsgs(sunrpc_nl_cmd_sock, cb);
+		if (ret < 0)
+			break;
+	}
+
+	nl_cb_put(cb);
+
+	if (data.err) {
+		int i;
+		for (i = 0; i < data.nreqs; i++) {
+			free(data.reqs[i].class);
+			free(data.reqs[i].addr);
+		}
+		free(data.reqs);
+		return data.err;
+	}
+
+	*reqs_out = data.reqs;
+	*nreqs_out = data.nreqs;
+	return 0;
+}
+
+static int nl_add_ip_map(struct nl_msg *msg, char *class, char *addr,
+			 char *domain)
+{
+	struct nlattr *nest;
+	time_t now = time(0);
+
+	nest = nla_nest_start(msg, SUNRPC_A_IP_MAP_REQS_REQUESTS);
+	if (!nest)
+		return -1;
+
+	if (nla_put_string(msg, SUNRPC_A_IP_MAP_CLASS, class) < 0 ||
+	    nla_put_string(msg, SUNRPC_A_IP_MAP_ADDR, addr) < 0 ||
+	    nla_put_u64(msg, SUNRPC_A_IP_MAP_EXPIRY,
+			now + default_ttl) < 0)
+		goto nla_failure;
+
+	if (domain) {
+		if (nla_put_string(msg, SUNRPC_A_IP_MAP_DOMAIN,
+				   domain) < 0)
+			goto nla_failure;
+	} else {
+		if (nla_put_flag(msg, SUNRPC_A_IP_MAP_NEGATIVE) < 0)
+			goto nla_failure;
+	}
+
+	nla_nest_end(msg, nest);
+	return 0;
+
+nla_failure:
+	nla_nest_cancel(msg, nest);
+	return -1;
+}
+
+static void cache_nl_process_ip_map(void)
+{
+	struct ip_map_req *reqs = NULL;
+	int nreqs = 0;
+	struct nl_msg *msg;
+	int i;
+
+	if (cache_nl_get_ip_map_reqs(&reqs, &nreqs)) {
+		xlog(L_WARNING, "cache_nl_process_ip_map: failed to get ip_map requests");
+		return;
+	}
+
+	if (!nreqs)
+		return;
+
+	xlog(D_CALL, "cache_nl_process_ip_map: %d pending ip_map requests",
+	     nreqs);
+
+	msg = cache_nl_new_msg(sunrpc_nl_family,
+			       SUNRPC_CMD_IP_MAP_SET_REQS, 0);
+	if (!msg)
+		goto out_free;
+
+	for (i = 0; i < nreqs; i++) {
+		char *class = reqs[i].class;
+		char *ipaddr = reqs[i].addr;
+		char *client = NULL;
+		char *domain = NULL;
+		char *dom_alloc = NULL;
+		struct addrinfo *tmp = NULL;
+
+		if (strcmp(class, "nfsd") == 0) {
+			tmp = host_pton(ipaddr);
+			if (tmp) {
+				struct addrinfo *ai;
+
+				ai = client_resolve(tmp->ai_addr);
+				if (ai) {
+					client = client_compose(ai);
+					nfs_freeaddrinfo(ai);
+				}
+			}
+
+			if (use_ipaddr && client) {
+				dom_alloc = malloc(strlen(ipaddr) + 2);
+				if (dom_alloc) {
+					dom_alloc[0] = '$';
+					strcpy(dom_alloc + 1, ipaddr);
+					domain = dom_alloc;
+				}
+			} else if (client) {
+				domain = *client ? client : "DEFAULT";
+			}
+		}
+
+		if (nl_add_ip_map(msg, class, ipaddr, domain) < 0) {
+			cache_nl_set_reqs(sunrpc_nl_cmd_sock, msg);
+			nlmsg_free(msg);
+			msg = cache_nl_new_msg(sunrpc_nl_family,
+					       SUNRPC_CMD_IP_MAP_SET_REQS, 0);
+			if (!msg) {
+				free(dom_alloc);
+				free(client);
+				nfs_freeaddrinfo(tmp);
+				goto out_free;
+			}
+			if (nl_add_ip_map(msg, class, ipaddr, domain) < 0)
+				xlog(L_WARNING, "%s: skipping oversized "
+				     "entry for %s", __func__, ipaddr);
+		}
+
+		if (tmp && !client)
+			xlog(D_AUTH, "failed authentication for IP %s",
+			     ipaddr);
+		else if (client && !use_ipaddr)
+			xlog(D_AUTH, "successful authentication for IP %s as %s",
+			     ipaddr, *client ? client : "DEFAULT");
+		else if (client)
+			xlog(D_AUTH, "successful authentication for IP %s",
+			     ipaddr);
+
+		free(dom_alloc);
+		free(client);
+		nfs_freeaddrinfo(tmp);
+	}
+
+	cache_nl_set_reqs(sunrpc_nl_cmd_sock, msg);
+	nlmsg_free(msg);
+
+out_free:
+	for (i = 0; i < nreqs; i++) {
+		free(reqs[i].class);
+		free(reqs[i].addr);
+	}
+	free(reqs);
+}
+
+/*
+ * unix_gid (auth.unix.gid) netlink handler
+ */
+struct unix_gid_req {
+	uid_t	uid;
+};
+
+struct get_unix_gid_reqs_data {
+	struct unix_gid_req	*reqs;
+	int			nreqs;
+	int			maxreqs;
+	int			err;
+};
+
+static int get_unix_gid_reqs_cb(struct nl_msg *msg, void *arg)
+{
+	struct get_unix_gid_reqs_data *data = arg;
+	struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
+	struct nlattr *attr;
+	int rem;
+
+	nla_for_each_attr(attr, genlmsg_attrdata(gnlh, 0),
+			  genlmsg_attrlen(gnlh, 0), rem) {
+		struct nlattr *tb[SUNRPC_A_UNIX_GID_EXPIRY + 1];
+		struct unix_gid_req *req;
+
+		if (nla_type(attr) != SUNRPC_A_UNIX_GID_REQS_REQUESTS)
+			continue;
+
+		if (nla_parse_nested(tb, SUNRPC_A_UNIX_GID_EXPIRY, attr,
+				     NULL))
+			continue;
+
+		if (!tb[SUNRPC_A_UNIX_GID_UID])
+			continue;
+
+		if (data->nreqs >= data->maxreqs) {
+			int newmax = data->maxreqs ? data->maxreqs * 2 : 16;
+			struct unix_gid_req *tmp;
+
+			tmp = realloc(data->reqs, newmax * sizeof(*tmp));
+			if (!tmp) {
+				data->err = -ENOMEM;
+				return NL_STOP;
+			}
+			data->reqs = tmp;
+			data->maxreqs = newmax;
+		}
+
+		req = &data->reqs[data->nreqs++];
+		req->uid = nla_get_u32(tb[SUNRPC_A_UNIX_GID_UID]);
+	}
+
+	return NL_OK;
+}
+
+static int cache_nl_get_unix_gid_reqs(struct unix_gid_req **reqs_out,
+				      int *nreqs_out)
+{
+	struct get_unix_gid_reqs_data data = { };
+	struct nl_msg *msg;
+	struct nl_cb *cb;
+	int done = 0;
+	int ret;
+
+	msg = cache_nl_new_msg(sunrpc_nl_family,
+			       SUNRPC_CMD_UNIX_GID_GET_REQS, NLM_F_DUMP);
+	if (!msg)
+		return -ENOMEM;
+
+	cb = nl_cb_alloc(NL_CB_DEFAULT);
+	if (!cb) {
+		nlmsg_free(msg);
+		return -ENOMEM;
+	}
+
+	nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, get_unix_gid_reqs_cb,
+		  &data);
+	nl_cb_set(cb, NL_CB_FINISH, NL_CB_CUSTOM, nl_finish_cb, &done);
+	nl_cb_err(cb, NL_CB_CUSTOM, nl_error_cb, &done);
+
+	ret = nl_send_auto(sunrpc_nl_cmd_sock, msg);
+	nlmsg_free(msg);
+	if (ret < 0) {
+		nl_cb_put(cb);
+		return ret;
+	}
+
+	while (!done) {
+		ret = nl_recvmsgs(sunrpc_nl_cmd_sock, cb);
+		if (ret < 0)
+			break;
+	}
+
+	nl_cb_put(cb);
+
+	if (data.err) {
+		free(data.reqs);
+		return data.err;
+	}
+
+	*reqs_out = data.reqs;
+	*nreqs_out = data.nreqs;
+	return 0;
+}
+
+static int nl_add_unix_gid(struct nl_msg *msg, uid_t uid, gid_t *groups,
+			   int ngroups)
+{
+	struct nlattr *nest;
+	time_t now = time(0);
+	int i;
+
+	nest = nla_nest_start(msg, SUNRPC_A_UNIX_GID_REQS_REQUESTS);
+	if (!nest)
+		return -1;
+
+	if (nla_put_u32(msg, SUNRPC_A_UNIX_GID_UID, uid) < 0 ||
+	    nla_put_u64(msg, SUNRPC_A_UNIX_GID_EXPIRY, now + default_ttl) < 0)
+		goto nla_failure;
+
+	if (ngroups >= 0) {
+		for (i = 0; i < ngroups; i++)
+			if (nla_put_u32(msg, SUNRPC_A_UNIX_GID_GIDS, groups[i]) < 0)
+				goto nla_failure;
+	} else {
+		if (nla_put_flag(msg, SUNRPC_A_UNIX_GID_NEGATIVE) < 0)
+			goto nla_failure;
+	}
+
+	nla_nest_end(msg, nest);
+	return 0;
+nla_failure:
+	nla_nest_cancel(msg, nest);
+	return -1;
+}
+
+static void cache_nl_process_unix_gid(void)
+{
+	struct unix_gid_req *reqs = NULL;
+	int nreqs = 0;
+	struct nl_msg *msg;
+	static gid_t *groups = NULL;
+	static int groups_len = 0;
+	int i;
+
+	if (cache_nl_get_unix_gid_reqs(&reqs, &nreqs)) {
+		xlog(L_WARNING, "cache_nl_process_unix_gid: failed to get unix_gid requests");
+		return;
+	}
+
+	if (!nreqs)
+		return;
+
+	xlog(D_CALL, "cache_nl_process_unix_gid: %d pending unix_gid requests",
+	     nreqs);
+
+	if (groups_len == 0) {
+		groups = malloc(sizeof(gid_t) * INITIAL_MANAGED_GROUPS);
+		if (!groups)
+			goto out_free;
+		groups_len = INITIAL_MANAGED_GROUPS;
+	}
+
+	msg = cache_nl_new_msg(sunrpc_nl_family,
+			       SUNRPC_CMD_UNIX_GID_SET_REQS, 0);
+	if (!msg)
+		goto out_free;
+
+	for (i = 0; i < nreqs; i++) {
+		uid_t uid = reqs[i].uid;
+		struct passwd *pw;
+		int ngroups;
+		int rv;
+		int ret;
+
+		ngroups = groups_len;
+		pw = getpwuid(uid);
+		if (!pw) {
+			rv = -1;
+		} else {
+			rv = getgrouplist(pw->pw_name, pw->pw_gid,
+					  groups, &ngroups);
+			if (rv == -1 && ngroups >= groups_len) {
+				gid_t *more_groups;
+
+				more_groups = realloc(groups,
+						      sizeof(gid_t) * ngroups);
+				if (!more_groups) {
+					rv = -1;
+				} else {
+					groups = more_groups;
+					groups_len = ngroups;
+					rv = getgrouplist(pw->pw_name,
+							  pw->pw_gid,
+							  groups, &ngroups);
+				}
+			}
+		}
+
+		if (rv >= 0)
+			ret = nl_add_unix_gid(msg, uid, groups, ngroups);
+		else
+			ret = nl_add_unix_gid(msg, uid, NULL, -1);
+
+		if (ret < 0) {
+			/* Flush current message and retry with a fresh one */
+			cache_nl_set_reqs(sunrpc_nl_cmd_sock, msg);
+			nlmsg_free(msg);
+			msg = cache_nl_new_msg(sunrpc_nl_family,
+					       SUNRPC_CMD_UNIX_GID_SET_REQS, 0);
+			if (!msg)
+				goto out_free;
+
+			if (rv >= 0)
+				ret = nl_add_unix_gid(msg, uid, groups, ngroups);
+			else
+				ret = nl_add_unix_gid(msg, uid, NULL, -1);
+			if (ret < 0)
+				xlog(L_WARNING, "%s: skipping oversized entry for uid %u",
+				     __func__, uid);
+		}
+	}
+
+	cache_nl_set_reqs(sunrpc_nl_cmd_sock, msg);
+	nlmsg_free(msg);
+
+out_free:
+	free(reqs);
+}
+
+static void cache_sunrpc_nl_process(void)
+{
+	unsigned int cache_mask;
+
+	/* Drain pending sunrpc notifications */
+	cache_mask = cache_sunrpc_nl_drain();
+
+	auth_reload();
+
+	/* Handle any pending ip_map requests */
+	if (cache_mask & SUNRPC_CACHE_TYPE_IP_MAP)
+		cache_nl_process_ip_map();
+
+	/* Handle any pending unix_gid requests */
+	if (manage_gids && (cache_mask & SUNRPC_CACHE_TYPE_UNIX_GID))
+		cache_nl_process_unix_gid();
 }
 
 static int can_reexport_via_fsidnum(struct exportent *exp, struct statfs *st)
@@ -1612,9 +3061,30 @@ extern int manage_gids;
  * cache_open - prepare communications channels with kernel RPC caches
  *
  */
-void cache_open(void) 
+void cache_open(void)
 {
 	int i;
+
+	if (!no_netlink && cache_nfsd_nl_open() == 0) {
+		if (cache_sunrpc_nl_open() == 0) {
+			/*
+			 * Check for pending requests, in case any
+			 * were queued before we opened the socket.
+			 */
+			auth_reload();
+			cache_nl_process_export();
+			cache_nl_process_expkey();
+			cache_nl_process_ip_map();
+			if (manage_gids)
+				cache_nl_process_unix_gid();
+			return;
+		}
+		xlog(L_NOTICE, "sunrpc netlink family unavailable, falling back to /proc");
+		nl_socket_free(nfsd_nl_notify_sock);
+		nfsd_nl_notify_sock = NULL;
+		nl_socket_free(nfsd_nl_cmd_sock);
+		nfsd_nl_cmd_sock = NULL;
+	}
 
 	for (i=0; cachelist[i].cache_name; i++ ) {
 		char path[100];
@@ -1636,13 +3106,17 @@ void cache_set_fds(fd_set *fdset)
 		if (cachelist[i].f >= 0)
 			FD_SET(cachelist[i].f, fdset);
 	}
+	if (nfsd_nl_notify_sock)
+		FD_SET(nl_socket_get_fd(nfsd_nl_notify_sock), fdset);
+	if (sunrpc_nl_notify_sock)
+		FD_SET(nl_socket_get_fd(sunrpc_nl_notify_sock), fdset);
 }
 
 /**
  * cache_process_req - process any active cache file descriptors during service loop iteration
  * @fdset: pointer to fd_set to examine for activity
  */
-int cache_process_req(fd_set *readfds) 
+int cache_process_req(fd_set *readfds)
 {
 	int i;
 	int cnt = 0;
@@ -1653,6 +3127,18 @@ int cache_process_req(fd_set *readfds)
 			cachelist[i].cache_handle(cachelist[i].f);
 			FD_CLR(cachelist[i].f, readfds);
 		}
+	}
+	if (nfsd_nl_notify_sock &&
+	    FD_ISSET(nl_socket_get_fd(nfsd_nl_notify_sock), readfds)) {
+		cnt++;
+		cache_nfsd_nl_process();
+		FD_CLR(nl_socket_get_fd(nfsd_nl_notify_sock), readfds);
+	}
+	if (sunrpc_nl_notify_sock &&
+	    FD_ISSET(nl_socket_get_fd(sunrpc_nl_notify_sock), readfds)) {
+		cnt++;
+		cache_sunrpc_nl_process();
+		FD_CLR(nl_socket_get_fd(sunrpc_nl_notify_sock), readfds);
 	}
 	return cnt;
 }
