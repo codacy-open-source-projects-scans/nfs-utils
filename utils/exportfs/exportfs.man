@@ -256,6 +256,23 @@ pair. This deletes the specified entry from
 .I /var/lib/nfs/etab
 and removes the corresponding kernel entry (if any).
 .PP
+When the last client for a given export path is unexported,
+.B exportfs
+signals the kernel to revoke NFSv4 state (opens, locks, and
+delegations) and release cached state for that path.
+Without this revocation, retained state would prevent the
+underlying filesystem from being unmounted.
+Affected clients receive
+.B NFS4ERR_ADMIN_REVOKED
+errors for operations that use revoked state.
+.PP
+.B "exportfs \-ua"
+does not revoke NFSv4 state, however.
+If
+.B nfsd
+is then restarted, clients may reclaim state during the
+grace period.
+.PP
 .SS Dumping the Export Table
 Invoking
 .B exportfs

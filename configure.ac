@@ -256,6 +256,8 @@ PKG_CHECK_MODULES(LIBNL3, libnl-3.0 >= 3.1)
 PKG_CHECK_MODULES(LIBNLGENL3, libnl-genl-3.0 >= 3.1)
 
 AC_CHECK_HEADERS(linux/nfsd_netlink.h)
+AC_DEFINE([HAVE_NFSD_NETLINK], 1,
+	  [Define to 1 if nfsd generic netlink support is available])
 
 # ensure we have the expkey attributes
 AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[#include <linux/nfsd_netlink.h>]],

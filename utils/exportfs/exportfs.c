@@ -39,6 +39,15 @@
 #include "xlog.h"
 #include "conffile.h"
 #include "reexport.h"
+#include "nfsdnl.h"
+
+#ifdef HAVE_NFSD_NETLINK
+#ifdef USE_SYSTEM_NFSD_NETLINK_H
+#include <linux/nfsd_netlink.h>
+#else
+#include "nfsd_netlink.h"
+#endif
+#endif
 
 #include <netlink/genl/genl.h>
 #include <netlink/genl/ctrl.h>
@@ -63,6 +72,7 @@ static void release_lockfile(void);
 
 static const char *lockfile = EXP_LOCKFILE;
 static int _lockfd = -1;
+static int f_unexport_all;
 
 /*
  * If we aren't careful, changes made by exportfs can be lost
@@ -246,7 +256,8 @@ main(int argc, char **argv)
 	 * don't care about what should be exported, as that
 	 * may require DNS lookups..
 	 */
-	if (! ( !f_export && f_all)) {
+	f_unexport_all = !f_export && f_all;
+	if (!f_unexport_all) {
 		/* note: xtab_*_read does not update entries if they already exist,
 		 * so this will not lose new options
 		 */
@@ -380,6 +391,26 @@ exportfs(char *arg, char *options, int verbose)
 		xlog(L_ERROR, "Invalid export syntax: %s", arg);
 }
 
+/*
+ * Check whether any active export remains for the given path across
+ * all client types.  Returns true if at least one export still has
+ * m_xtabent set.
+ */
+static int
+path_still_exported(const char *path, size_t nlen)
+{
+	nfs_export *exp;
+	int i;
+
+	for (i = 0; i < MCL_MAXTYPES; i++)
+		for (exp = exportlist[i].p_head; exp; exp = exp->m_next)
+			if (exp->m_xtabent &&
+			    strlen(exp->m_export.e_path) == nlen &&
+			    strncmp(path, exp->m_export.e_path, nlen) == 0)
+				return 1;
+	return 0;
+}
+
 static void
 unexportfs_parsed(char *hname, char *path, int verbose)
 {
@@ -434,9 +465,39 @@ unexportfs_parsed(char *hname, char *path, int verbose)
 		exp->m_mayexport = 0;
 		success = 1;
 	}
-	if (!success)
+	if (!success) {
 		xlog(L_ERROR, "Could not find '%s:%s' to unexport.", hname, path);
+		goto out;
+	}
 
+	/*
+	 * If no exports remain for this path, ask the kernel to
+	 * revoke any NFSv4 state and close cached file handles
+	 * associated with exports of this path.  This enables the
+	 * underlying filesystem to be unmounted.
+	 *
+	 * Skip this during "exportfs -ua" -- that is a shutdown
+	 * operation.  Clients should wait for nfsd to restart and
+	 * reclaim state through the grace period rather than
+	 * receiving NFS4ERR_ADMIN_REVOKED.
+	 */
+#ifdef HAVE_NFSD_NETLINK
+	if (!f_unexport_all && !path_still_exported(path, nlen)) {
+		char pathbuf[NFS_MAXPATHLEN + 1];
+		int ret;
+
+		memcpy(pathbuf, path, nlen);
+		pathbuf[nlen] = '\0';
+		ret = nfsd_nl_cmd_str(NFSD_CMD_UNLOCK_EXPORT,
+				      NFSD_A_UNLOCK_EXPORT_PATH,
+				      pathbuf);
+		if (ret && ret != -ENOSYS)
+			xlog(L_WARNING,
+			     "Failed to release state for %s: %s",
+			     pathbuf, strerror(-ret));
+	}
+#endif
+out:
 	nfs_freeaddrinfo(ai);
 }
 
